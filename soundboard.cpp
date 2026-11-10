@@ -1,4 +1,9 @@
-#include "shared.hpp"
+#include "soundboard.hpp"
+#include "tone.hpp"
+#include <android/log.h>
+#include <mutex>
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "soundboard", __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "soundboard", __VA_ARGS__)
 #include <SLES/OpenSLES.h>
 #include <SLES/OpenSLES_Android.h>
 #include <cmath>
@@ -17,30 +22,22 @@ static SLPlayItf    g_play       = nullptr;
 static SLAndroidSimpleBufferQueueItf g_bufQueue = nullptr;
 
 static bool g_slReady = false;
-
-// Generate a simple tone into a buffer
-// type: 0=sine, 1=square, 2=sawtooth, 3=noise, 4=chirp
-static std::vector<int16_t> MakeTone(float freqHz, float durationSec, int type, float amp=0.6f) {
-    int sr = 44100;
-    int samples = (int)(sr * durationSec);
-    std::vector<int16_t> buf(samples);
-    static uint32_t rng = 1234567u;
-    for (int i=0;i<samples;i++){
-        float t = (float)i / sr;
-        float v = 0;
-        float f = type==4 ? freqHz*(1+t/durationSec) : freqHz;
-        switch(type){
-        case 0: v=sinf(2*3.14159f*f*t); break;
-        case 1: v=fmodf(f*t,1)<0.5f?1:-1; break;
-        case 2: v=2*fmodf(f*t,1)-1; break;
-        case 3: rng^=rng<<13;rng^=rng>>17;rng^=rng<<5;v=(float)(rng&0xffff)/32767.f-1; break;
-        case 4: v=sinf(2*3.14159f*f*t); break;
-        }
-        // Fade out last 10%
-        float fade = i>(int)(samples*0.9f)?(float)(samples-i)/(samples*0.1f):1.f;
-        buf[i]=(int16_t)(v*amp*fade*32767);
-    }
-    return buf;
+static std::mutex g_audioMutex;
+static void StopCurrent();
+static void ShutdownSL() {
+    StopCurrent();
+    if (g_mixObj) (*g_mixObj)->Destroy(g_mixObj);
+    if (g_engineObj) (*g_engineObj)->Destroy(g_engineObj);
+    g_mixObj = nullptr;
+    g_engineObj = nullptr;
+    g_engine = nullptr;
+    g_slReady = false;
+}
+static bool CheckSL(SLresult result, const char* operation) {
+    if (result == SL_RESULT_SUCCESS) return true;
+    LOGE("%s failed: %u", operation, static_cast<unsigned>(result));
+    ShutdownSL();
+    return false;
 }
 
 struct Clip {
@@ -49,7 +46,6 @@ struct Clip {
 };
 
 static std::vector<Clip> g_clips;
-static int g_playingClip = -1;
 
 static void BuildClips() {
     g_clips.clear();
@@ -72,17 +68,15 @@ static bool InitSL() {
     if (g_slReady) return true;
     SLresult r;
     r = slCreateEngine(&g_engineObj, 0, nullptr, 0, nullptr, nullptr);
-    if (r!=SL_RESULT_SUCCESS){LOGE("SL engine create failed %d",r);return false;}
+    if (!CheckSL(r, "SL engine create failed")) return false;
     r = (*g_engineObj)->Realize(g_engineObj, SL_BOOLEAN_FALSE);
-    if (r!=SL_RESULT_SUCCESS){LOGE("SL engine realize failed %d",r);return false;}
+    if (!CheckSL(r, "SL engine realize failed")) return false;
     r = (*g_engineObj)->GetInterface(g_engineObj, SL_IID_ENGINE, &g_engine);
-    if (r!=SL_RESULT_SUCCESS){LOGE("SL engine iface failed %d",r);return false;}
-    SLInterfaceID mixIds[]={};
-    SLboolean mixReq[]={};
-    r = (*g_engine)->CreateOutputMix(g_engine, &g_mixObj, 0, mixIds, mixReq);
-    if (r!=SL_RESULT_SUCCESS){LOGE("SL mix create failed %d",r);return false;}
+    if (!CheckSL(r, "SL engine iface failed")) return false;
+    r = (*g_engine)->CreateOutputMix(g_engine, &g_mixObj, 0, nullptr, nullptr);
+    if (!CheckSL(r, "SL mix create failed")) return false;
     r = (*g_mixObj)->Realize(g_mixObj, SL_BOOLEAN_FALSE);
-    if (r!=SL_RESULT_SUCCESS){LOGE("SL mix realize failed %d",r);return false;}
+    if (!CheckSL(r, "SL mix realize failed")) return false;
     g_slReady = true;
     LOGI("OpenSLES ready");
     return true;
@@ -93,6 +87,7 @@ static void StopCurrent() {
 }
 
 void Soundboard_Play(int idx) {
+    std::lock_guard<std::mutex> lock(g_audioMutex);
     if (idx<0||idx>=(int)g_clips.size()) return;
     if (!InitSL()) return;
     StopCurrent();
@@ -111,21 +106,31 @@ void Soundboard_Play(int idx) {
     const SLInterfaceID ids[]={SL_IID_ANDROIDSIMPLEBUFFERQUEUE};
     const SLboolean req[]={SL_BOOLEAN_TRUE};
     SLresult r=(*g_engine)->CreateAudioPlayer(g_engine,&g_playerObj,&src,&sink,1,ids,req);
-    if(r!=SL_RESULT_SUCCESS){LOGE("SL player create failed %d",r);return;}
+    if (!CheckSL(r, "SL player create failed")) return;
     r=(*g_playerObj)->Realize(g_playerObj,SL_BOOLEAN_FALSE);
-    if(r!=SL_RESULT_SUCCESS){LOGE("SL player realize failed %d",r);return;}
-    (*g_playerObj)->GetInterface(g_playerObj,SL_IID_PLAY,&g_play);
-    (*g_playerObj)->GetInterface(g_playerObj,SL_IID_ANDROIDSIMPLEBUFFERQUEUE,&g_bufQueue);
-    (*g_bufQueue)->Enqueue(g_bufQueue,clip.pcm.data(),(SLuint32)(clip.pcm.size()*sizeof(int16_t)));
-    (*g_play)->SetPlayState(g_play,SL_PLAYSTATE_PLAYING);
-    g_playingClip = idx;
+    if (!CheckSL(r, "SL player realize failed")) return;
+    if (!CheckSL((*g_playerObj)->GetInterface(g_playerObj,SL_IID_PLAY,&g_play), "audio playback")) return;
+    if (!CheckSL((*g_playerObj)->GetInterface(g_playerObj,SL_IID_ANDROIDSIMPLEBUFFERQUEUE,&g_bufQueue), "audio playback")) return;
+    if (!CheckSL((*g_bufQueue)->Enqueue(g_bufQueue,clip.pcm.data(),(SLuint32)(clip.pcm.size()*sizeof(int16_t))), "audio playback")) return;
+    if (!CheckSL((*g_play)->SetPlayState(g_play,SL_PLAYSTATE_PLAYING), "audio playback")) return;
     LOGI("Soundboard: playing '%s'", clip.name);
 }
 
-int Soundboard_Count()            { return (int)g_clips.size(); }
-const char* Soundboard_Name(int i){ return (i>=0&&i<(int)g_clips.size())?g_clips[i].name:""; }
+int Soundboard_Count() { return 12; }
+const char* Soundboard_Name(int i) {
+    std::lock_guard<std::mutex> lock(g_audioMutex);
+    return (i>=0&&i<(int)g_clips.size())?g_clips[i].name:"";
+}
 
 void Soundboard_Init() {
+    std::lock_guard<std::mutex> lock(g_audioMutex);
+    if (!g_clips.empty()) return;
     BuildClips();
     LOGI("Soundboard: %d clips built", (int)g_clips.size());
+}
+
+void Soundboard_Shutdown() {
+    std::lock_guard<std::mutex> lock(g_audioMutex);
+    ShutdownSL();
+    g_clips.clear();
 }

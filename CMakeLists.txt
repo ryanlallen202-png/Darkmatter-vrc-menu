@@ -1,0 +1,17 @@
+cmake_minimum_required(VERSION 3.22)
+project(darkmatter_audio LANGUAGES CXX)
+
+# The standalone audio target intentionally excludes client patching/injection.
+if(ANDROID)
+    add_library(darkmatter-audio SHARED soundboard.cpp)
+    target_compile_features(darkmatter-audio PRIVATE cxx_std_17)
+    target_compile_options(darkmatter-audio PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    target_link_libraries(darkmatter-audio PRIVATE OpenSLES log)
+else()
+    enable_testing()
+    add_executable(tone_test tests/tone_test.cpp)
+    target_include_directories(tone_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_compile_features(tone_test PRIVATE cxx_std_17)
+    target_compile_options(tone_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    add_test(NAME tone_test COMMAND tone_test)
+endif()
