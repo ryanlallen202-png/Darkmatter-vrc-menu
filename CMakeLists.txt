@@ -3,7 +3,7 @@ project(darkmatter_audio LANGUAGES CXX)
 
 # The standalone audio target intentionally excludes client patching/injection.
 if(ANDROID)
-    add_library(darkmatter-audio SHARED soundboard.cpp)
+    add_library(darkmatter-audio SHARED soundboard.cpp audio_jni.cpp)
     target_compile_features(darkmatter-audio PRIVATE cxx_std_17)
     target_compile_options(darkmatter-audio PRIVATE -Wall -Wextra -Wpedantic -Werror)
     target_link_libraries(darkmatter-audio PRIVATE OpenSLES log)

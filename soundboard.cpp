@@ -86,13 +86,13 @@ static void StopCurrent() {
     if (g_playerObj){(*g_playerObj)->Destroy(g_playerObj);g_playerObj=nullptr;g_play=nullptr;g_bufQueue=nullptr;}
 }
 
-void Soundboard_Play(int idx) {
+bool Soundboard_Play(int idx) {
     std::lock_guard<std::mutex> lock(g_audioMutex);
-    if (idx<0||idx>=(int)g_clips.size()) return;
-    if (!InitSL()) return;
+    if (idx<0||idx>=(int)g_clips.size()) return false;
+    if (!InitSL()) return false;
     StopCurrent();
     Clip &clip = g_clips[idx];
-    if (clip.pcm.empty()) return;
+    if (clip.pcm.empty()) return false;
 
     SLDataLocator_AndroidSimpleBufferQueue bqLoc={SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE,2};
     SLDataFormat_PCM fmt={
@@ -106,14 +106,15 @@ void Soundboard_Play(int idx) {
     const SLInterfaceID ids[]={SL_IID_ANDROIDSIMPLEBUFFERQUEUE};
     const SLboolean req[]={SL_BOOLEAN_TRUE};
     SLresult r=(*g_engine)->CreateAudioPlayer(g_engine,&g_playerObj,&src,&sink,1,ids,req);
-    if (!CheckSL(r, "SL player create failed")) return;
+    if (!CheckSL(r, "SL player create failed")) return false;
     r=(*g_playerObj)->Realize(g_playerObj,SL_BOOLEAN_FALSE);
-    if (!CheckSL(r, "SL player realize failed")) return;
-    if (!CheckSL((*g_playerObj)->GetInterface(g_playerObj,SL_IID_PLAY,&g_play), "audio playback")) return;
-    if (!CheckSL((*g_playerObj)->GetInterface(g_playerObj,SL_IID_ANDROIDSIMPLEBUFFERQUEUE,&g_bufQueue), "audio playback")) return;
-    if (!CheckSL((*g_bufQueue)->Enqueue(g_bufQueue,clip.pcm.data(),(SLuint32)(clip.pcm.size()*sizeof(int16_t))), "audio playback")) return;
-    if (!CheckSL((*g_play)->SetPlayState(g_play,SL_PLAYSTATE_PLAYING), "audio playback")) return;
+    if (!CheckSL(r, "SL player realize failed")) return false;
+    if (!CheckSL((*g_playerObj)->GetInterface(g_playerObj,SL_IID_PLAY,&g_play), "audio playback")) return false;
+    if (!CheckSL((*g_playerObj)->GetInterface(g_playerObj,SL_IID_ANDROIDSIMPLEBUFFERQUEUE,&g_bufQueue), "audio playback")) return false;
+    if (!CheckSL((*g_bufQueue)->Enqueue(g_bufQueue,clip.pcm.data(),(SLuint32)(clip.pcm.size()*sizeof(int16_t))), "audio playback")) return false;
+    if (!CheckSL((*g_play)->SetPlayState(g_play,SL_PLAYSTATE_PLAYING), "audio playback")) return false;
     LOGI("Soundboard: playing '%s'", clip.name);
+    return true;
 }
 
 int Soundboard_Count() { return 12; }
