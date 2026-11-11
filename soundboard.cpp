@@ -1,131 +1,431 @@
-#include "shared.hpp"
-#include <SLES/OpenSLES.h>
-#include <SLES/OpenSLES_Android.h>
-#include <cmath>
+// soundboard.cpp — all-format audio decode + server-sided Photon broadcast
+// FFmpegKit handles wav/mp3/ogg/flac/aiff/wma/m4a decode → mono PCM float[]
+// Server-side: PCM chunks sent via Photon RaiseEvent 0xA0 to all clients
+// Receiving clients reconstruct and play via VRChat's AudioSource invoke path
 
-// ============================================================================
-// Soundboard — 12 generated tone / effect clips
-// Plays locally through the Quest headset speakers via OpenSLES.
-// Each clip is a short synthesized PCM buffer (44100Hz, mono, 16-bit).
-// ============================================================================
+#include "soundboard.h"
+#include "gunlib.h"
+#include "il2cpp_init.h"
+#include "offsets.h"
+#include <android/log.h>
+#include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+#include <string>
+#include <mutex>
+#include <thread>
 
-static SLObjectItf  g_engineObj  = nullptr;
-static SLEngineItf  g_engine     = nullptr;
-static SLObjectItf  g_mixObj     = nullptr;
-static SLObjectItf  g_playerObj  = nullptr;
-static SLPlayItf    g_play       = nullptr;
-static SLAndroidSimpleBufferQueueItf g_bufQueue = nullptr;
+// FFmpegKit Android — bundled AAR, all codecs
+#include "ffmpegkit/FFmpegKit.h"
+#include "ffmpegkit/FFmpegSession.h"
 
-static bool g_slReady = false;
+#define TAG "VRCMenu/Sound"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-// Generate a simple tone into a buffer
-// type: 0=sine, 1=square, 2=sawtooth, 3=noise, 4=chirp
-static std::vector<int16_t> MakeTone(float freqHz, float durationSec, int type, float amp=0.6f) {
-    int sr = 44100;
-    int samples = (int)(sr * durationSec);
-    std::vector<int16_t> buf(samples);
-    static uint32_t rng = 1234567u;
-    for (int i=0;i<samples;i++){
-        float t = (float)i / sr;
-        float v = 0;
-        float f = type==4 ? freqHz*(1+t/durationSec) : freqHz;
-        switch(type){
-        case 0: v=sinf(2*3.14159f*f*t); break;
-        case 1: v=fmodf(f*t,1)<0.5f?1:-1; break;
-        case 2: v=2*fmodf(f*t,1)-1; break;
-        case 3: rng^=rng<<13;rng^=rng>>17;rng^=rng<<5;v=(float)(rng&0xffff)/32767.f-1; break;
-        case 4: v=sinf(2*3.14159f*f*t); break;
-        }
-        // Fade out last 10%
-        float fade = i>(int)(samples*0.9f)?(float)(samples-i)/(samples*0.1f):1.f;
-        buf[i]=(int16_t)(v*amp*fade*32767);
-    }
-    return buf;
-}
+namespace Soundboard
+{
+    static const uint8_t kAudioEvent  = 0xA0;
+    static const int     kChunkSamples = 4096;   // samples per Photon packet
+    static const int     kSampleRate   = 44100;
+    static const char*   kTmpPCM       = "/data/local/tmp/vrcmenu_pcm.raw";
 
-struct Clip {
-    const char *name;
-    std::vector<int16_t> pcm;
-};
-
-static std::vector<Clip> g_clips;
-static int g_playingClip = -1;
-
-static void BuildClips() {
-    g_clips.clear();
-    // 12 fun clips
-    g_clips.push_back({"Bruh",          MakeTone(120,  0.6f, 0)});   // low sine drop
-    g_clips.push_back({"Vine Boom",     MakeTone(60,   0.3f, 1)});   // square thud
-    g_clips.push_back({"Nope",          MakeTone(440,  0.1f, 1)});   // short buzz
-    g_clips.push_back({"Oof",           MakeTone(200,  0.4f, 2)});   // sawtooth mid
-    g_clips.push_back({"Air Horn",      MakeTone(880,  0.8f, 1)});   // square high
-    g_clips.push_back({"Fart",          MakeTone(80,   0.5f, 3)});   // noise low
-    g_clips.push_back({"Siren",         MakeTone(600,  1.0f, 4)});   // chirp up
-    g_clips.push_back({"Laser",         MakeTone(1200, 0.4f, 4)});   // chirp high
-    g_clips.push_back({"Sad Trombone",  MakeTone(220,  1.2f, 2)});   // saw down
-    g_clips.push_back({"Achievement",   MakeTone(880,  0.3f, 0)});   // sine ding
-    g_clips.push_back({"Explosion",     MakeTone(50,   0.7f, 3)});   // noise bass
-    g_clips.push_back({"Level Up",      MakeTone(440,  0.5f, 4)});   // chirp medium
-}
-
-static bool InitSL() {
-    if (g_slReady) return true;
-    SLresult r;
-    r = slCreateEngine(&g_engineObj, 0, nullptr, 0, nullptr, nullptr);
-    if (r!=SL_RESULT_SUCCESS){LOGE("SL engine create failed %d",r);return false;}
-    r = (*g_engineObj)->Realize(g_engineObj, SL_BOOLEAN_FALSE);
-    if (r!=SL_RESULT_SUCCESS){LOGE("SL engine realize failed %d",r);return false;}
-    r = (*g_engineObj)->GetInterface(g_engineObj, SL_IID_ENGINE, &g_engine);
-    if (r!=SL_RESULT_SUCCESS){LOGE("SL engine iface failed %d",r);return false;}
-    SLInterfaceID mixIds[]={};
-    SLboolean mixReq[]={};
-    r = (*g_engine)->CreateOutputMix(g_engine, &g_mixObj, 0, mixIds, mixReq);
-    if (r!=SL_RESULT_SUCCESS){LOGE("SL mix create failed %d",r);return false;}
-    r = (*g_mixObj)->Realize(g_mixObj, SL_BOOLEAN_FALSE);
-    if (r!=SL_RESULT_SUCCESS){LOGE("SL mix realize failed %d",r);return false;}
-    g_slReady = true;
-    LOGI("OpenSLES ready");
-    return true;
-}
-
-static void StopCurrent() {
-    if (g_playerObj){(*g_playerObj)->Destroy(g_playerObj);g_playerObj=nullptr;g_play=nullptr;g_bufQueue=nullptr;}
-}
-
-void Soundboard_Play(int idx) {
-    if (idx<0||idx>=(int)g_clips.size()) return;
-    if (!InitSL()) return;
-    StopCurrent();
-    Clip &clip = g_clips[idx];
-    if (clip.pcm.empty()) return;
-
-    SLDataLocator_AndroidSimpleBufferQueue bqLoc={SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE,2};
-    SLDataFormat_PCM fmt={
-        SL_DATAFORMAT_PCM, 1, SL_SAMPLINGRATE_44_1,
-        SL_PCMSAMPLEFORMAT_FIXED_16, SL_PCMSAMPLEFORMAT_FIXED_16,
-        SL_SPEAKER_FRONT_CENTER, SL_BYTEORDER_LITTLEENDIAN
+    struct Clip
+    {
+        std::string       path;
+        std::vector<float> pcm;
+        int               sampleRate = 44100;
+        bool              valid      = false;
     };
-    SLDataSource src={&bqLoc,&fmt};
-    SLDataLocator_OutputMix outLoc={SL_DATALOCATOR_OUTPUTMIX,g_mixObj};
-    SLDataSink sink={&outLoc,nullptr};
-    const SLInterfaceID ids[]={SL_IID_ANDROIDSIMPLEBUFFERQUEUE};
-    const SLboolean req[]={SL_BOOLEAN_TRUE};
-    SLresult r=(*g_engine)->CreateAudioPlayer(g_engine,&g_playerObj,&src,&sink,1,ids,req);
-    if(r!=SL_RESULT_SUCCESS){LOGE("SL player create failed %d",r);return;}
-    r=(*g_playerObj)->Realize(g_playerObj,SL_BOOLEAN_FALSE);
-    if(r!=SL_RESULT_SUCCESS){LOGE("SL player realize failed %d",r);return;}
-    (*g_playerObj)->GetInterface(g_playerObj,SL_IID_PLAY,&g_play);
-    (*g_playerObj)->GetInterface(g_playerObj,SL_IID_ANDROIDSIMPLEBUFFERQUEUE,&g_bufQueue);
-    (*g_bufQueue)->Enqueue(g_bufQueue,clip.pcm.data(),(SLuint32)(clip.pcm.size()*sizeof(int16_t)));
-    (*g_play)->SetPlayState(g_play,SL_PLAYSTATE_PLAYING);
-    g_playingClip = idx;
-    LOGI("Soundboard: playing '%s'", clip.name);
-}
 
-int Soundboard_Count()            { return (int)g_clips.size(); }
-const char* Soundboard_Name(int i){ return (i>=0&&i<(int)g_clips.size())?g_clips[i].name:""; }
+    static std::vector<Clip> g_clips;
+    static std::mutex        g_clipMu;
 
-void Soundboard_Init() {
-    BuildClips();
-    LOGI("Soundboard: %d clips built", (int)g_clips.size());
+    // ── IL2CPP resolved methods for remote audio playback ─────────────────
+    // Receiving clients need to construct an AudioClip and play it.
+    // We hook the Photon event dispatcher to intercept 0xA0 on all clients.
+    static void* g_AudioClipCreate   = nullptr; // AudioClip.Create(name,len,ch,freq,stream)
+    static void* g_AudioClipSetData  = nullptr; // AudioClip.SetData(float[],offset)
+    static void* g_AudioSourcePlay   = nullptr; // AudioSource.Play()
+    static void* g_AudioSourceStop   = nullptr; // AudioSource.Stop()
+    static void* g_AudioSourceSetClip= nullptr; // AudioSource.set_clip
+    static void* g_AudioSourceSetVol = nullptr; // AudioSource.set_volume
+    static void* g_AudioSourceSetLoop= nullptr; // AudioSource.set_loop
+    static void* g_PhotonEventHook   = nullptr; // ShadowHook on Photon event dispatch
+
+    // Accumulation buffer for incoming PCM chunks (all-client receive path)
+    struct RemoteBuf
+    {
+        std::vector<float> pcm;
+        int  sampleRate = 44100;
+        bool loop       = false;
+        float vol       = 1.0f;
+        bool ready      = false;
+    };
+    static RemoteBuf g_remoteBuf;
+    static std::mutex g_remoteMu;
+    static void* g_audioSource = nullptr;  // persistent AudioSource on local player GO
+
+    // ── FFmpegKit decode → mono float PCM ────────────────────────────────
+    static bool DecodeFile(const std::string& path,
+                           std::vector<float>& outPCM, int& outSR)
+    {
+        // Remove stale tmp file
+        remove(kTmpPCM);
+
+        // Build FFmpeg command: decode any input → s16le mono 44100 raw
+        std::string cmd =
+            "-y -i \"" + path + "\""
+            " -f s16le -acodec pcm_s16le -ac 1 -ar 44100"
+            " \"" + kTmpPCM + "\"";
+
+        LOGI("Decoding: %s", path.c_str());
+
+        // Execute synchronously (FFmpegKit C API)
+        // ffmpegkit_execute blocks until done
+        auto session = FFmpegKit::execute(cmd.c_str());
+        auto rc = session->getReturnCode();
+        if (!ReturnCode::isSuccess(rc))
+        {
+            LOGE("FFmpeg decode failed: %s",
+                 session->getFailStackTrace() ? session->getFailStackTrace() : "unknown");
+            return false;
+        }
+
+        // Read raw PCM
+        FILE* f = fopen(kTmpPCM, "rb");
+        if (!f) { LOGE("PCM tmp file open failed"); return false; }
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (sz <= 0) { fclose(f); LOGE("PCM empty"); return false; }
+
+        std::vector<int16_t> raw(sz / 2);
+        fread(raw.data(), 2, raw.size(), f);
+        fclose(f);
+        remove(kTmpPCM);
+
+        outPCM.resize(raw.size());
+        for (size_t i = 0; i < raw.size(); i++)
+            outPCM[i] = raw[i] / 32768.0f;
+
+        outSR = kSampleRate;
+        LOGI("Decoded %zu samples (%.2f sec) from %s",
+             outPCM.size(), outPCM.size() / (float)kSampleRate, path.c_str());
+        return true;
+    }
+
+    // ── Photon event dispatcher hook ──────────────────────────────────────
+    // VRChat processes incoming Photon events in LoadBalancingClient.OnEvent
+    // or a generated dispatch method. We hook it to intercept 0xA0 for playback.
+    // Method name from IL2CPP patterns:
+    //   ExitGames.Client.Photon.LoadBalancingClient.OnEvent(EventData)
+    using OnEventFn = void(*)(void* client, void* eventData);
+    static OnEventFn g_origOnEvent = nullptr;
+    static void* g_onEventHook = nullptr;
+
+    static void OnEventHook(void* client, void* eventData)
+    {
+        // Extract event code from EventData object
+        // EventData.Code field at offset 0x10 (uint8_t after Il2CppObject header)
+        uint8_t code = *reinterpret_cast<uint8_t*>(
+            reinterpret_cast<uint8_t*>(eventData) + 0x10);
+
+        if (code == kAudioEvent)
+        {
+            // CustomData field at offset 0x18 (object* = byte[] payload)
+            void* customData = *reinterpret_cast<void**>(
+                reinterpret_cast<uint8_t*>(eventData) + 0x18);
+
+            if (customData)
+            {
+                // Il2CppArray: max_length @ 0x18, data @ 0x20
+                int32_t len = *reinterpret_cast<int32_t*>(
+                    reinterpret_cast<uint8_t*>(customData) + 0x18);
+                uint8_t* payload = reinterpret_cast<uint8_t*>(customData) + 0x20;
+
+                if (len >= 1)
+                {
+                    uint8_t cmd = payload[0];
+                    std::lock_guard<std::mutex> lk(g_remoteMu);
+
+                    if (cmd == 0xFF)  // STOP
+                    {
+                        g_remoteBuf.ready = false;
+                        g_remoteBuf.pcm.clear();
+                        // Stop playback — will be picked up in Update tick
+                    }
+                    else if (cmd == 0x01 && len >= 10)  // START
+                    {
+                        g_remoteBuf.pcm.clear();
+                        g_remoteBuf.sampleRate = *reinterpret_cast<int32_t*>(payload + 1);
+                        g_remoteBuf.loop       = payload[5] != 0;
+                        memcpy(&g_remoteBuf.vol, payload + 6, 4);
+                        // PCM data follows header (10 bytes)
+                        int samples = (len - 10) / 4;
+                        float* pcm_in = reinterpret_cast<float*>(payload + 10);
+                        g_remoteBuf.pcm.insert(g_remoteBuf.pcm.end(),
+                                               pcm_in, pcm_in + samples);
+                    }
+                    else if ((cmd == 0x02 || cmd == 0x03) && len >= 10)  // DATA / END
+                    {
+                        int samples = (len - 10) / 4;
+                        float* pcm_in = reinterpret_cast<float*>(payload + 10);
+                        g_remoteBuf.pcm.insert(g_remoteBuf.pcm.end(),
+                                               pcm_in, pcm_in + samples);
+                        if (cmd == 0x03) g_remoteBuf.ready = true;  // END → trigger play
+                    }
+                }
+            }
+        }
+
+        // Always call original
+        if (g_origOnEvent) g_origOnEvent(client, eventData);
+    }
+
+    // ── Init ──────────────────────────────────────────────────────────────
+    void Init()
+    {
+        // Module deferred — resolve after IL2CPP ready
+        LOGI("Soundboard init deferred.");
+    }
+
+    static bool EnsureResolved()
+    {
+        if (!il2cpp::Ready()) return false;
+        if (g_AudioClipCreate) return true;
+
+        g_AudioClipCreate = il2cpp::ResolveMethod(
+            UNITY_ASSEMBLY, UNITY_NS, "AudioClip",
+            "Create", 5);  // (string name, int len, int ch, int freq, bool stream)
+        g_AudioClipSetData = il2cpp::ResolveMethod(
+            UNITY_ASSEMBLY, UNITY_NS, "AudioClip",
+            "SetData", 2);  // (float[] data, int offsetSamples)
+        g_AudioSourcePlay = il2cpp::ResolveMethod(
+            UNITY_ASSEMBLY, UNITY_NS, "AudioSource",
+            "Play", 0);
+        g_AudioSourceStop = il2cpp::ResolveMethod(
+            UNITY_ASSEMBLY, UNITY_NS, "AudioSource",
+            "Stop", 0);
+        g_AudioSourceSetClip = il2cpp::ResolveMethod(
+            UNITY_ASSEMBLY, UNITY_NS, "AudioSource",
+            "set_clip", 1);
+        g_AudioSourceSetVol = il2cpp::ResolveMethod(
+            UNITY_ASSEMBLY, UNITY_NS, "AudioSource",
+            "set_volume", 1);
+        g_AudioSourceSetLoop = il2cpp::ResolveMethod(
+            UNITY_ASSEMBLY, UNITY_NS, "AudioSource",
+            "set_loop", 1);
+
+        // Hook Photon OnEvent for receive path
+        void* onEventPtr = il2cpp::ResolveMethod(
+            PHOTON_ASSEMBLY, PHOTON_NS, PHOTON_CLASS_LBC,
+            "OnEvent", 1);
+        if (onEventPtr)
+        {
+            g_onEventHook = shadowhook_hook_func_addr(
+                onEventPtr, (void*)OnEventHook, (void**)&g_origOnEvent);
+            LOGI("Photon OnEvent hook: %s",
+                 g_onEventHook ? "ok" : shadowhook_to_errmsg(shadowhook_get_errno()));
+        }
+
+        LOGI("Soundboard resolved: create=%p setdata=%p play=%p",
+             g_AudioClipCreate, g_AudioClipSetData, g_AudioSourcePlay);
+        return g_AudioClipCreate != nullptr;
+    }
+
+    // ── Build IL2CPP float[] from PCM data ────────────────────────────────
+    static void* BuildFloatArray(const float* pcm, int len)
+    {
+        static void* s_float_class = nullptr;
+        if (!s_float_class)
+        {
+            void* asmb = il2cpp::domain_assembly_open(il2cpp::g_domain, "mscorlib.dll");
+            void* img  = il2cpp::assembly_get_image(asmb);
+            s_float_class = il2cpp::class_from_name(img, "System", "Single");
+        }
+        if (!s_float_class || !il2cpp::array_new) return nullptr;
+        void* arr = il2cpp::array_new(s_float_class, len);
+        if (!arr) return nullptr;
+        float* d = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(arr) + 0x20);
+        memcpy(d, pcm, len * sizeof(float));
+        return arr;
+    }
+
+    // ── Build an AudioClip IL2CPP object ──────────────────────────────────
+    static void* BuildAudioClip(const float* pcm, int len,
+                                 int sampleRate, const char* name)
+    {
+        if (!g_AudioClipCreate || !g_AudioClipSetData) return nullptr;
+        void* exc = nullptr;
+
+        void* nameStr = il2cpp::string_new(name);
+        int32_t ch    = 1;
+        bool    stream = false;
+        void* args[5] = { nameStr, &len, &ch, &sampleRate, &stream };
+        void* clip = il2cpp::runtime_invoke(g_AudioClipCreate, nullptr, args, &exc);
+        if (!clip || exc) { LOGE("AudioClip.Create failed"); return nullptr; }
+
+        void* floatArr = BuildFloatArray(pcm, len);
+        if (!floatArr) return nullptr;
+
+        int32_t offset = 0;
+        void* sd_args[2] = { floatArr, &offset };
+        il2cpp::runtime_invoke(g_AudioClipSetData, clip, sd_args, &exc);
+
+        return clip;
+    }
+
+    // ── Tick — called from Java UI thread periodically to trigger playback ─
+    // (Java side calls MenuBridge.nativeTick() from a Handler every 100ms)
+    void Tick()
+    {
+        if (!EnsureResolved()) return;
+
+        bool doPlay = false;
+        RemoteBuf snap;
+        {
+            std::lock_guard<std::mutex> lk(g_remoteMu);
+            if (g_remoteBuf.ready)
+            {
+                snap = g_remoteBuf;
+                g_remoteBuf.ready = false;
+                g_remoteBuf.pcm.clear();
+                doPlay = true;
+            }
+        }
+
+        if (!doPlay || snap.pcm.empty()) return;
+
+        void* clip = BuildAudioClip(snap.pcm.data(), (int)snap.pcm.size(),
+                                    snap.sampleRate, "vrcmenu_remote");
+        if (!clip) return;
+
+        // Get AudioSource from local player (cached)
+        if (!g_audioSource)
+        {
+            // Allocate a new AudioSource on the local player GO via AddComponent
+            // Simplified: resolve AddComponent and AudioSource type
+            void* addComp = il2cpp::ResolveMethod(
+                UNITY_ASSEMBLY, UNITY_NS, "GameObject",
+                "AddComponent", 1);  // AddComponent(Type)
+            static void* s_as_class = nullptr;
+            if (!s_as_class)
+            {
+                void* asmb = il2cpp::domain_assembly_open(il2cpp::g_domain, UNITY_ASSEMBLY);
+                void* img  = il2cpp::assembly_get_image(asmb);
+                s_as_class = il2cpp::class_from_name(img, UNITY_NS, "AudioSource");
+            }
+            if (addComp && s_as_class && il2cpp::class_get_type)
+            {
+                // Need local GO — reuse Player module's GetLocalGO
+                // For now: piggyback on a known GO; full impl hooks avatar load
+                // FILL: wire up to Player::GetLocalGO() once modules share header
+            }
+        }
+
+        if (!g_audioSource) return;
+
+        void* exc = nullptr;
+        // set_clip, set_loop, set_volume, Play
+        void* clip_args[1]  = { clip };
+        bool  loop          = snap.loop;
+        float vol           = snap.vol;
+        void* loop_args[1]  = { &loop };
+        void* vol_args[1]   = { &vol };
+
+        il2cpp::runtime_invoke(g_AudioSourceSetClip, g_audioSource, clip_args, &exc);
+        il2cpp::runtime_invoke(g_AudioSourceSetLoop, g_audioSource, loop_args, &exc);
+        il2cpp::runtime_invoke(g_AudioSourceSetVol,  g_audioSource, vol_args,  &exc);
+        il2cpp::runtime_invoke(g_AudioSourcePlay,    g_audioSource, nullptr,   &exc);
+        LOGI("Remote audio playing (%zu samples)", snap.pcm.size());
+    }
+
+    // ── Public API ────────────────────────────────────────────────────────
+    bool LoadClip(const char* path)
+    {
+        Clip c;
+        c.path = path;
+        c.valid = DecodeFile(path, c.pcm, c.sampleRate);
+        if (!c.valid) { LOGE("Load failed: %s", path); return false; }
+        std::lock_guard<std::mutex> lk(g_clipMu);
+        g_clips.push_back(std::move(c));
+        LOGI("Clip loaded [%zu]: %s", g_clips.size() - 1, path);
+        return true;
+    }
+
+    void PlayServer(int idx, bool loop, float vol)
+    {
+        if (!EnsureResolved()) { LOGE("IL2CPP not ready"); return; }
+
+        Clip clip;
+        {
+            std::lock_guard<std::mutex> lk(g_clipMu);
+            if (idx < 0 || idx >= (int)g_clips.size()) return;
+            if (!g_clips[idx].valid) return;
+            clip = g_clips[idx];  // copy for thread safety
+        }
+
+        // Send PCM in chunks via Photon
+        // Packet layout (bytes):
+        //   [0]     cmd (0x01=START, 0x02=DATA, 0x03=END)
+        //   [1-4]   sampleRate (int32 LE)
+        //   [5]     loop (bool)
+        //   [6-9]   volume (float32 LE)
+        //   [10..N] PCM chunk (float32 LE samples)
+        const int kHeaderSize = 10;
+        int total  = (int)clip.pcm.size();
+        int offset = 0;
+        bool first = true;
+
+        std::vector<uint8_t> packet(kHeaderSize + kChunkSamples * 4);
+
+        while (offset < total)
+        {
+            int chunkLen = std::min(kChunkSamples, total - offset);
+            bool last    = (offset + chunkLen) >= total;
+
+            uint8_t cmd = first ? 0x01 : (last ? 0x03 : 0x02);
+            packet[0] = cmd;
+            int32_t sr = clip.sampleRate;
+            memcpy(&packet[1], &sr, 4);
+            packet[5] = loop ? 1 : 0;
+            memcpy(&packet[6], &vol, 4);
+            memcpy(&packet[kHeaderSize], clip.pcm.data() + offset, chunkLen * 4);
+
+            int pktLen = kHeaderSize + chunkLen * 4;
+            Gunlib::PhotonRaiseEventBytes(kAudioEvent, packet.data(), pktLen,
+                                          1 /* All */, nullptr, 0, true);
+            offset += chunkLen;
+            first   = false;
+        }
+        LOGI("Server audio sent: %d samples, loop=%d vol=%.2f", total, loop, vol);
+    }
+
+    void StopAll()
+    {
+        uint8_t stop = 0xFF;
+        Gunlib::PhotonRaiseEventBytes(kAudioEvent, &stop, 1,
+                                      1 /* All */, nullptr, 0, true);
+        LOGI("StopAll sent.");
+    }
+
+    int  ClipCount()
+    {
+        std::lock_guard<std::mutex> lk(g_clipMu);
+        return (int)g_clips.size();
+    }
+
+    const char* ClipName(int idx)
+    {
+        std::lock_guard<std::mutex> lk(g_clipMu);
+        if (idx < 0 || idx >= (int)g_clips.size()) return "";
+        // Return just filename portion
+        const std::string& p = g_clips[idx].path;
+        size_t pos = p.rfind('/');
+        return (pos == std::string::npos) ? p.c_str() : p.c_str() + pos + 1;
+    }
+
+    void SetAudioSource(void* src) { g_audioSource = src; }
 }
