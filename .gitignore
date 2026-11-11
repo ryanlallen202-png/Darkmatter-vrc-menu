@@ -1,0 +1,20 @@
+# Build trees
+build/
+build-host/
+out/
+cmake-build-*/
+
+# Object/artifact residue
+*.o
+*.so
+*.a
+*.ninja
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+
+# Editor/OS
+.DS_Store
+*.swp
+.vscode/
+.idea/

@@ -2,42 +2,82 @@ name: Build vrc-quest
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, 'arena/**' ]
+  pull_request:
   workflow_dispatch:
 
 jobs:
-  build:
+  # -------------------------------------------------------------------------
+  # Host syntax gate: every translation unit compiles against the stub headers
+  # before the NDK toolchain is even unpacked. Catches header and ABI mistakes
+  # in ~30 s instead of after a 500 MB NDK download.
+  # -------------------------------------------------------------------------
+  host-check:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - name: Install compiler + cmake
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake ninja-build g++
+
+      - name: Configure (host stubs)
+        run: cmake -B build-host -G Ninja -DVRC_HOST_CHECK=ON -DCMAKE_BUILD_TYPE=Release
+
+      - name: Compile + link all units
+        run: cmake --build build-host --target vrc-host-check -j"$(nproc)"
+
+  # -------------------------------------------------------------------------
+  # Android build: arm64 only (Quest is arm64-only), 16 KB page size, strict.
+  # -------------------------------------------------------------------------
+  build:
+    needs: host-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Install NDK r27c
         run: |
-          wget -q https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
-          unzip -q android-ndk-r27c-linux.zip
-          echo "ANDROID_NDK=$PWD/android-ndk-r27c" >> $GITHUB_ENV
+          curl -sSLo ndk.zip https://dl.google.com/android/repository/android-ndk-r27c-linux.zip
+          unzip -q ndk.zip
+          echo "ANDROID_NDK=$PWD/android-ndk-r27c" >> "$GITHUB_ENV"
 
       - name: Install CMake + Ninja
-        run: sudo apt-get install -y cmake ninja-build
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake ninja-build
+
+      - name: Configure
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-29 \
+            -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Verify artifact
         run: |
-          cmake -B build \
-            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
-            -DANDROID_ABI=arm64-v8a \
-            -DANDROID_PLATFORM=android-26 \
-            -DCMAKE_BUILD_TYPE=Release \
-            -G Ninja
-          cmake --build build
+          set -e
+          test -f build/libvrc-quest.so
+          file build/libvrc-quest.so
+          # Entry points must be present and exported.
+          "$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" \
+            -D --defined-only build/libvrc-quest.so | grep -q JNI_OnLoad
+          echo "JNI_OnLoad exported"
 
       - name: Collect
         run: |
           mkdir -p out
           cp build/libvrc-quest.so out/
+          cp README.md out/ 2>/dev/null || true
 
-      - name: Upload
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: vrc-quest
+          name: vrc-quest-arm64
           path: out/libvrc-quest.so
+          if-no-files-found: error
