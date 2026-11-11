@@ -1,13 +1,31 @@
 #include "shared.hpp"
 
 // ============================================================================
-// Forward decls from other modules
+// In-world menu
+//
+// World-space uGUI canvas parented to the left hand. Cursor is a small quad
+// driven by the right index finger; right trigger clicks. L3 opens/closes.
+//
+// Layout (canvas pixels, 1 px = 1 mm):
+//   ┌──────────────────────────────────────────────┐
+//   │ Dark Matter   VRChat Quest        FPS: 72.0  │
+//   │ [Dock in Front of Face]                      │
+//   │ [Player][Exploits][Visual][Players][Sound]…  │
+//   │  content rows                                │
+//   └──────────────────────────────────────────────┘
+//
+// Every component is created with a real System.Type (AddComponent(Type)) —
+// passing a raw Il2CppClass* is the classic silent failure and is not done
+// anywhere in this file.
 // ============================================================================
+
+// ---- module surface -------------------------------------------------------
 extern bool f_fly, f_velocityFly, f_speed, f_noclip, f_lowGravity, f_noGravity;
 extern bool f_platforms, f_punch, f_esp, f_skybox, f_skyRainbow;
 extern bool f_worldBlocks, f_blockRainbow, f_portalGun, f_orbitCam;
 extern bool f_freeze, f_spin, f_bigHead, f_invisible, f_nameSpoof, f_antiEac;
 extern int  g_speedTier, g_skyColorIdx;
+extern float g_flySpeed, g_flapMult;
 
 void Feature_SaveSpot();
 void Feature_GoToSpot();
@@ -20,727 +38,994 @@ size_t Feature_PlayerCount();
 const char* Feature_PlayerName(int);
 float Feature_PlayerDist(int);
 bool  Feature_PlayerIsLocal(int);
+int   Feature_PlayerActor(int);
 bool  Feature_LeftStickClick();
 bool  Feature_BtnA();
 bool  Feature_RTrigger();
+bool  Feature_LTrigger();
 float Feature_RAxisX();
 float Feature_RAxisY();
+float* Feature_FlySpeedPtr();
+float* Feature_FlapMultPtr();
 
-void Soundboard_Play(int);
-int  Soundboard_Count();
-const char* Soundboard_Name(int);
+namespace GunLib {
+    bool  Ready();
+    bool  CrashTarget(int actorNr);
+    bool  StartLag(float ratePerSec);
+    void  StopLag();
+    bool  Kick(int actorNr);
+    bool  IsLagging();
+    float LagRate();
+    void  Shutdown();
+}
+namespace Soundboard  { bool PlayLocal(int); bool PlayNetwork(int); void StopAll(); }
+namespace EventPump   { uint64_t AudioFrames(); uint64_t Dropped(); }
 
 // ============================================================================
-// Menu layout — matches screenshot exactly
-// Dark background, no animated dots/lines, tab bar across top,
-// checkboxes + sliders in content area, FPS top-left, title top-left,
-// "Dock in Front of Face" button under title.
-//
-// Rendered as a world-space Unity Canvas parented to left hand.
-// Cursor: right hand index finger position → hovering a button highlights it,
-// right trigger = click.
-// Open/close: left joystick click (L3).
+// GunLib + soundboard state (targets, path input, status strings)
 // ============================================================================
+static int   g_gunTarget = 0;
+static int   g_soundSel  = 0;
+static char  g_gunTargetLabel[96] = "Target: (none)";
+static float g_lagRate   = 60.f;
+static char  g_soundPath[512] = "";
+static char  g_soundStatus[128] = "";
 
-// ---- Tab definitions -------------------------------------------------------
-enum Tab { TAB_PLAYER, TAB_EXPLOITS, TAB_VISUAL, TAB_PLAYERS, TAB_SOUNDBOARD,
-           TAB_TEXT, TAB_MISC, TAB_CONFIG, TAB_COUNT };
-static const char *kTabNames[TAB_COUNT] = {
-    "Player","Exploits","Visual","Players","Soundboard","Text","Misc","Config"
+static void SetGunTarget(int idx) {
+    if (idx < 0) { g_gunTarget = 0; snprintf(g_gunTargetLabel, sizeof g_gunTargetLabel, "Target: (none)"); return; }
+    g_gunTarget = Feature_PlayerActor(idx);
+    snprintf(g_gunTargetLabel, sizeof g_gunTargetLabel, "Target: %s (#%d)",
+             Feature_PlayerName(idx), g_gunTarget);
+    LOGI("gun target -> %s (%d)", Feature_PlayerName(idx), g_gunTarget);
+}
+
+static void Action_Crash() { GunLib::CrashTarget(g_gunTarget); }
+static void Action_Lag()   {
+    if (GunLib::IsLagging()) GunLib::StopLag();
+    else GunLib::StartLag(g_lagRate);
+}
+static void Action_StopAudio() { Soundboard::StopAll(); }
+static void Action_Broadcast() {
+    // Broadcasts the highlighted clip. Selection follows the last click in the
+    // clip list, so the button works as "send what I just picked".
+    if (g_soundSel < 0 || g_soundSel >= Soundboard::Count()) return;
+    Soundboard::PlayNetwork(g_soundSel);
+}
+static void Action_Kick()  { GunLib::Kick(g_gunTarget); }
+static void Action_LoadSound() {
+    if (!g_soundPath[0]) { snprintf(g_soundStatus, sizeof g_soundStatus, "no path set"); return; }
+    if (Soundboard::AddFile(g_soundPath)) {
+        snprintf(g_soundStatus, sizeof g_soundStatus, "loaded: %s", Soundboard::Name(Soundboard::Count()-1));
+    } else {
+        snprintf(g_soundStatus, sizeof g_soundStatus, "failed: %s", Soundboard::FileError());
+    }
+}
+
+// ============================================================================
+// Tabs
+// ============================================================================
+enum Tab {
+    TAB_PLAYER, TAB_EXPLOITS, TAB_VISUAL, TAB_PLAYERS,
+    TAB_SOUNDBOARD, TAB_TEXT, TAB_MISC, TAB_CONFIG, TAB_COUNT
 };
-static Tab  g_activeTab   = TAB_PLAYER;
-static bool g_menuOpen    = false;
-static bool g_docked      = false;   // docked in front of face vs left-hand
-static double g_openAt    = 0;
+static const char *kTabNames[TAB_COUNT] = {
+    "Player","Exploits","Visual","Players","Sound","GunLib","Misc","Config"
+};
 
-// ---- Unity UI class cache --------------------------------------------------
+// ============================================================================
+// uGUI cache — every method resolved once, null-checked at call site
+// ============================================================================
 static struct UIClasses {
     bool ready = false;
-    Il2CppClass *Canvas, *Text, *Image, *Button, *Toggle, *Slider,
-                *RectTransform, *Font, *GameObject, *Transform,
-                *ContentSizeFitter, *VerticalLayoutGroup, *HorizontalLayoutGroup;
-    MethodInfo  *CanvasSetMode, *CanvasSetSortOrder,
-                *TrGetPos, *TrSetPos, *TrGetRot, *TrSetRot,
-                *TrSetParent, *TrSetLP, *TrSetLR, *TrSetLS,
-                *RtSetSD, *RtSetAnchorMin, *RtSetAnchorMax, *RtSetPivot,
-                *TextSetText, *TextSetFontSize, *TextSetColor, *TextSetFont,
-                *TextSetAlign, *TextSetBestFit, *TextSetMinSize, *TextSetMaxSize,
-                *ImageSetColor, *ImageSetSprite,
-                *GoGetTr, *GoGetComp, *GoAddComp, *GoSetActive, *GoNew,
-                *ObjDestroy, *ObjAlive,
-                *FontGetDefault;
-    Il2CppClass *Camera, *Input;
-    MethodInfo  *CamGetMain, *CamWStoSS,
-                *InputGetButton, *InputGetButtonDown, *InputGetAxis;
-    MethodInfo  *ShaderFind;
-    Il2CppClass *Shader, *Material;
-    MethodInfo  *MatNew, *MatSetColor, *MatSetShader;
+    Il2CppClass *Canvas=nullptr, *Text=nullptr, *Image=nullptr,
+                *RectTransform=nullptr, *Font=nullptr,
+                *GameObject=nullptr, *Transform=nullptr,
+                *Graphic=nullptr, *Object=nullptr, *Resources=nullptr,
+                *Camera=nullptr, *Input=nullptr;
+    MethodInfo  *CanvasSetMode=nullptr, *CanvasSetWorldCam=nullptr,
+                *TrSetParent=nullptr, *TrSetLP=nullptr, *TrSetLR=nullptr,
+                *TrSetLS=nullptr, *TrGetPos=nullptr, *TrSetPos=nullptr,
+                *TrGetRot=nullptr, *TrSetRot=nullptr, *TrGetFwd=nullptr,
+                *TrGetParent=nullptr,
+                *RtSetSD=nullptr, *RtSetPivot=nullptr, *RtSetAnchorMin=nullptr,
+                *RtSetAnchorMax=nullptr,
+                *TextSetText=nullptr, *TextSetFontSize=nullptr,
+                *TextSetFont=nullptr, *TextSetAlign=nullptr,
+                *TextSetBestFit=nullptr, *TextSetMinSize=nullptr,
+                *TextSetMaxSize=nullptr, *TextSetHLayout=nullptr,
+                *GraphicSetColor=nullptr,
+                *GoGetTr=nullptr, *GoAddComp=nullptr, *GoGetComp=nullptr,
+                *GoSetActive=nullptr, *GoGetActive=nullptr,
+                *ObjDestroy=nullptr, *ObjAlive=nullptr,
+                *FontFromOSFont=nullptr, *ResourcesBuiltin=nullptr,
+                *CamGetMain=nullptr, *InputGetAxis=nullptr,
+                *RtCtor_=nullptr;
 } UI;
 
 static bool InitUI() {
     if (UI.ready) return true;
     if (!IL2.ready) return false;
+
 #define C(v,ns,n,a) UI.v=IL2.GetClass(ns,n,a);
 #define M(v,c,n,argc) UI.v=IL2.GetMethod(UI.c,n,argc);
-    C(Canvas,       "UnityEngine",    "Canvas",             "UnityEngine")
-    C(Text,         "UnityEngine.UI", "Text",               "UnityEngine.UI")
-    C(Image,        "UnityEngine.UI", "Image",              "UnityEngine.UI")
-    C(Button,       "UnityEngine.UI", "Button",             "UnityEngine.UI")
-    C(Toggle,       "UnityEngine.UI", "Toggle",             "UnityEngine.UI")
-    C(Slider,       "UnityEngine.UI", "Slider",             "UnityEngine.UI")
-    C(RectTransform,"UnityEngine",    "RectTransform",      "UnityEngine")
-    C(Font,         "UnityEngine",    "Font",               "UnityEngine")
-    C(GameObject,   "UnityEngine",    "GameObject",         "UnityEngine")
-    C(Transform,    "UnityEngine",    "Transform",          "UnityEngine")
-    C(Camera,       "UnityEngine",    "Camera",             "UnityEngine")
-    C(Input,        "UnityEngine",    "Input",              "UnityEngine")
-    C(Shader,       "UnityEngine",    "Shader",             "UnityEngine")
-    C(Material,     "UnityEngine",    "Material",           "UnityEngine")
+    C(Canvas,       "UnityEngine",   "Canvas",       "UnityEngine.CoreModule")
+    if (!UI.Canvas) C(Canvas, "UnityEngine", "Canvas", "UnityEngine")
+    C(Text,         "UnityEngine.UI","Text",         "UnityEngine.UI")
+    C(Image,        "UnityEngine.UI","Image",        "UnityEngine.UI")
+    C(Graphic,      "UnityEngine.UI","Graphic",      "UnityEngine.UI")
+    C(RectTransform,"UnityEngine",   "RectTransform","UnityEngine.CoreModule")
+    if (!UI.RectTransform) C(RectTransform, "UnityEngine", "RectTransform", "UnityEngine")
+    C(Font,         "UnityEngine",   "Font",         "UnityEngine.TextRenderingModule")
+    if (!UI.Font) C(Font, "UnityEngine", "Font", "UnityEngine")
+    C(GameObject,   "UnityEngine",   "GameObject",   "UnityEngine.CoreModule")
+    if (!UI.GameObject) C(GameObject, "UnityEngine", "GameObject", "UnityEngine")
+    C(Transform,    "UnityEngine",   "Transform",    "UnityEngine.CoreModule")
+    if (!UI.Transform) C(Transform, "UnityEngine", "Transform", "UnityEngine")
+    C(Object,       "UnityEngine",   "Object",       "UnityEngine.CoreModule")
+    C(Resources,    "UnityEngine",   "Resources",    "UnityEngine.CoreModule")
+    C(Camera,       "UnityEngine",   "Camera",       "UnityEngine.CoreModule")
+    C(Input,        "UnityEngine",   "Input",        "UnityEngine.InputLegacyModule")
 
-    M(CanvasSetMode,    Canvas,   "set_renderMode",          1)
-    M(TrGetPos,         Transform,"get_position",            0)
-    M(TrSetPos,         Transform,"set_position",            1)
-    M(TrGetRot,         Transform,"get_rotation",            0)
-    M(TrSetRot,         Transform,"set_rotation",            1)
-    M(TrSetParent,      Transform,"SetParent",               2)
-    M(TrSetLP,          Transform,"set_localPosition",       1)
-    M(TrSetLR,          Transform,"set_localRotation",       1)
-    M(TrSetLS,          Transform,"set_localScale",          1)
-    M(RtSetSD,          RectTransform,"set_sizeDelta",       1)
-    M(RtSetAnchorMin,   RectTransform,"set_anchorMin",       1)
-    M(RtSetAnchorMax,   RectTransform,"set_anchorMax",       1)
-    M(RtSetPivot,       RectTransform,"set_pivot",           1)
-    M(TextSetText,      Text,     "set_text",                1)
-    M(TextSetFontSize,  Text,     "set_fontSize",            1)
-    M(TextSetColor,     Text,     "set_color",               1) // via Graphic
-    M(TextSetFont,      Text,     "set_font",                1)
-    M(TextSetAlign,     Text,     "set_alignment",           1)
-    M(TextSetBestFit,   Text,     "set_resizeTextForBestFit",1)
-    M(TextSetMinSize,   Text,     "set_resizeTextMinSize",   1)
-    M(TextSetMaxSize,   Text,     "set_resizeTextMaxSize",   1)
-    M(ImageSetColor,    Image,    "set_color",               1) // via Graphic
-    M(GoGetTr,          GameObject,"get_transform",          0)
-    M(GoGetComp,        GameObject,"GetComponent",           1)
-    M(GoAddComp,        GameObject,"AddComponent",           1)
-    M(GoSetActive,      GameObject,"SetActive",              1)
-    M(ObjDestroy,       GameObject,"Destroy",                1) // static on Object
-    M(CamGetMain,       Camera,   "get_main",                0)
-    M(InputGetButton,   Input,    "GetButton",               1)
-    M(InputGetButtonDown,Input,   "GetButtonDown",           1)
-    M(InputGetAxis,     Input,    "GetAxis",                 1)
-    M(ShaderFind,       Shader,   "Find",                    1)
-    M(MatSetColor,      Material, "set_color",               1)
-    M(MatSetShader,     Material, "set_shader",              1)
+    // Rendering a canvas in world space needs a camera on the canvas.
+    M(CanvasSetMode,     Canvas, "set_renderMode",      1)
+    M(CanvasSetWorldCam, Canvas, "set_worldCamera",     1)
+    M(TextSetText,       Text,   "set_text",            1)
+    M(TextSetFontSize,   Text,   "set_fontSize",        1)
+    M(TextSetFont,       Text,   "set_font",            1)
+    M(TextSetAlign,      Text,   "set_alignment",       1)
+    M(TextSetBestFit,    Text,   "set_resizeTextForBestFit", 1)
+    M(TextSetMinSize,    Text,   "set_resizeTextMinSize",    1)
+    M(TextSetMaxSize,    Text,   "set_resizeTextMaxSize",    1)
+    M(GraphicSetColor,   Graphic,"set_color",           1)
+    M(FontFromOSFont,    Font,   "CreateDynamicFontFromOSFont", 2)
+    M(ResourcesBuiltin,  Resources, "GetBuiltinResource", 2)
+    M(TrSetParent,       Transform, "SetParent",        2)
+    M(TrSetLP,           Transform, "set_localPosition", 1)
+    M(TrSetLR,           Transform, "set_localRotation", 1)
+    M(TrSetLS,           Transform, "set_localScale",    1)
+    M(TrGetPos,          Transform, "get_position",      0)
+    M(TrSetPos,          Transform, "set_position",      1)
+    M(TrGetRot,          Transform, "get_rotation",      0)
+    M(TrSetRot,          Transform, "set_rotation",      1)
+    M(TrGetFwd,          Transform, "get_forward",       0)
+    M(TrGetParent,       Transform, "get_parent",        0)
+    M(RtSetSD,           RectTransform, "set_sizeDelta", 1)
+    M(RtSetPivot,        RectTransform, "set_pivot",     1)
+    M(RtSetAnchorMin,    RectTransform, "set_anchorMin", 1)
+    M(RtSetAnchorMax,    RectTransform, "set_anchorMax", 1)
+    M(GoGetTr,           GameObject, "get_transform",    0)
+    M(GoAddComp,         GameObject, "AddComponent",     1)
+    M(GoGetComp,         GameObject, "GetComponent",     1)
+    M(GoSetActive,       GameObject, "SetActive",        1)
+    M(ObjDestroy,        Object,     "Destroy",          1)
+    M(ObjAlive,          Object,     "op_Implicit",      1)
+    M(CamGetMain,        Camera,     "get_main",         0)
+    M(InputGetAxis,      Input,      "GetAxis",          1)
 #undef C
 #undef M
-    // Font.GetDefault() or use Resources.GetBuiltinResource
-    Il2CppClass *res = IL2.GetClass("UnityEngine","Resources","UnityEngine");
-    if (res) {
-        UI.FontGetDefault = IL2.GetMethod(res,"GetBuiltinResource",2);
-    }
-    Il2CppClass *obj = IL2.GetClass("UnityEngine","Object","UnityEngine");
-    if (obj) UI.ObjAlive = IL2.GetMethod(obj,"op_Implicit",1);
-    Il2CppClass *obj2 = IL2.GetClass("UnityEngine","Object","UnityEngine");
-    if (obj2) UI.ObjDestroy = IL2.GetMethod(obj2,"Destroy",1);
 
-    UI.ready = UI.Canvas && UI.Text && UI.RectTransform && UI.GameObject;
-    LOGI("UI classes %s", UI.ready?"ready":"INCOMPLETE");
+    UI.ready = UI.Canvas && UI.Text && UI.RectTransform && UI.GameObject &&
+               UI.GoAddComp && UI.GoGetTr && IL2.TypeOf(UI.Text) != nullptr;
+    LOGI("UI classes %s (Type%p)", UI.ready ? "ready" : "INCOMPLETE",
+         (void*)IL2.TypeOf(UI.Text));
     return UI.ready;
 }
 
-// ---- Theme (matches screenshot: dark grey bg, white text, blue-ish tabs) ---
-static const Color kBgColor       = {0.08f,0.08f,0.10f,0.96f};
-static const Color kPanelColor    = {0.12f,0.12f,0.15f,1.00f};
-static const Color kTabActive     = {0.25f,0.35f,0.55f,1.00f};
-static const Color kTabInactive   = {0.18f,0.18f,0.22f,1.00f};
-static const Color kBtnColor      = {0.20f,0.20f,0.25f,1.00f};
-static const Color kBtnHover      = {0.30f,0.40f,0.65f,1.00f};
-static const Color kCheckOn       = {0.25f,0.55f,0.90f,1.00f};
-static const Color kCheckOff      = {0.18f,0.18f,0.22f,1.00f};
-static const Color kTextColor     = {0.90f,0.90f,0.95f,1.00f};
-static const Color kTextDim       = {0.55f,0.55f,0.60f,1.00f};
-static const Color kTitleColor    = {0.75f,0.85f,1.00f,1.00f};
-static const Color kSliderBg      = {0.15f,0.15f,0.18f,1.00f};
-static const Color kSliderFill    = {0.30f,0.50f,0.90f,1.00f};
-
-// ---- Simple GO/component helpers -------------------------------------------
-static bool Alive(Il2CppObject *o) {
-    if (!o || !UI.ObjAlive) return o!=nullptr;
-    Il2CppObject *r = IL2.Invoke(UI.ObjAlive, nullptr, (void**)&o);
-    return r ? IL2.Unbox<int32_t>(r)!=0 : false;
+// ============================================================================
+// Object helpers — all take/return raw objects; ownership is by Ref at the
+// call site where the object must outlive the frame.
+// ============================================================================
+static bool  Alive(Il2CppObject* o) {
+    if (!o) return false;
+    if (!UI.ObjAlive) return true;
+    void* a[1] = { o };
+    Il2CppObject* r = IL2.Invoke(UI.ObjAlive, nullptr, a);
+    return r && IL2.Unbox<bool>(r);
 }
-static void Kill(Il2CppObject *o) {
-    if (Alive(o) && UI.ObjDestroy) { void*a[1]={o}; IL2.Invoke(UI.ObjDestroy, nullptr, a); }
+static void  Kill(Il2CppObject* o) {
+    if (!o || !UI.ObjDestroy) return;
+    void* a[1] = { o };
+    IL2.Invoke(UI.ObjDestroy, nullptr, a);
 }
-static Il2CppObject *Tr(Il2CppObject *go) {
-    return Alive(go)&&UI.GoGetTr ? IL2.Invoke(UI.GoGetTr, go) : nullptr;
+static Il2CppObject* Tr(Il2CppObject* go) {
+    if (!go || !UI.GoGetTr) return nullptr;
+    return IL2.Invoke(UI.GoGetTr, go);
 }
-static void SetLP(Il2CppObject *go, Vec3 p) {
-    if (!Alive(go)||!UI.TrSetLP) return;
-    Il2CppObject *t=Tr(go); void*a[1]={&p}; IL2.Invoke(UI.TrSetLP,t,a);
+static void SetLP(Il2CppObject* go, Vec3 p) {
+    Il2CppObject* t = Tr(go); if (!t || !UI.TrSetLP) return;
+    void* a[1] = { &p }; IL2.Invoke(UI.TrSetLP, t, a);
 }
-static void SetLS(Il2CppObject *go, Vec3 s) {
-    if (!Alive(go)||!UI.TrSetLS) return;
-    Il2CppObject *t=Tr(go); void*a[1]={&s}; IL2.Invoke(UI.TrSetLS,t,a);
+static void SetLS(Il2CppObject* go, Vec3 s) {
+    Il2CppObject* t = Tr(go); if (!t || !UI.TrSetLS) return;
+    void* a[1] = { &s }; IL2.Invoke(UI.TrSetLS, t, a);
 }
-static void SetSD(Il2CppObject *go, Vec2 sd) {
-    if (!Alive(go)||!UI.RtSetSD) return;
-    Il2CppObject *t=Tr(go); void*a[1]={&sd}; IL2.Invoke(UI.RtSetSD,t,a);
+static void SetSD(Il2CppObject* go, float w, float h) {
+    if (!go || !UI.RtSetSD) return;
+    // set_sizeDelta lives on RectTransform; the GameObject's Transform pointer
+    // is the same native object for uGUI elements.
+    Il2CppObject* t = Tr(go); if (!t) return;
+    Vec2 sd{ w, h };
+    void* a[1] = { &sd };
+    IL2.Invoke(UI.RtSetSD, t, a);
 }
-static void Parent(Il2CppObject *child, Il2CppObject *parent, bool worldPos=false) {
-    if (!Alive(child)||!Alive(parent)||!UI.TrSetParent) return;
-    Il2CppObject *ct=Tr(child),*pt=Tr(parent);
-    int b=worldPos?1:0; void*a[2]={pt,&b}; IL2.Invoke(UI.TrSetParent,ct,a);
+static void Parent(Il2CppObject* child, Il2CppObject* parent, bool worldStays) {
+    if (!child || !parent || !UI.TrSetParent) return;
+    Il2CppObject* ct = Tr(child); Il2CppObject* pt = Tr(parent);
+    if (!ct || !pt) return;
+    bool b = worldStays;
+    void* a[2] = { pt, &b };
+    IL2.Invoke(UI.TrSetParent, ct, a);
 }
-static void Show(Il2CppObject *go, bool on) {
-    if (Alive(go)&&UI.GoSetActive){void*a[1]={&on};IL2.Invoke(UI.GoSetActive,go,a);}
+static void Show(Il2CppObject* go, bool on) {
+    if (!go || !UI.GoSetActive) return;
+    void* a[1] = { &on };
+    IL2.Invoke(UI.GoSetActive, go, a);
 }
-
-static Il2CppObject *NewGO(const char *name, Il2CppObject *parent=nullptr) {
-    if (!UI.GameObject||!IL2.object_new) return nullptr;
-    Il2CppObject *go=IL2.object_new(UI.GameObject);
-    MethodInfo *ctor=IL2.GetMethod(UI.GameObject,".ctor",1);
-    if(ctor){void*a[1]={IL2.StrNew(name)};IL2.Invoke(ctor,go,a);}
-    if(parent) Parent(go,parent,false);
-    return go;
+static Il2CppObject* AddComp(Il2CppObject* go, Il2CppClass* cls) {
+    if (!go || !cls || !UI.GoAddComp) return nullptr;
+    Il2CppObject* type = IL2.TypeOf(cls);          // System.Type, not Il2CppClass
+    if (!type) { LOGE("AddComp: no System.Type for %p", (void*)cls); return nullptr; }
+    void* a[1] = { type };
+    return IL2.Invoke(UI.GoAddComp, go, a);
 }
-static Il2CppObject *AddComp(Il2CppObject *go, Il2CppClass *cls) {
-    if (!Alive(go)||!cls||!UI.GoAddComp) return nullptr;
-    void*a[1]={(void*)cls};  // pass MonoType* — works for AddComponent(Type)
-    // Need to pass as System.Type: get the MonoType
-    BNM::MonoType *mt = nullptr; // IL2CPP wraps GetMonoType internally
-    // Fallback: use the class pointer directly (works in most VRC IL2CPP builds)
-    return IL2.Invoke(UI.GoAddComp, go, (void**)&cls);
-}
-static Il2CppObject *GetComp(Il2CppObject *go, Il2CppClass *cls) {
-    if (!Alive(go)||!cls||!UI.GoGetComp) return nullptr;
-    return IL2.Invoke(UI.GoGetComp, go, (void**)&cls);
+static Il2CppObject* GetComp(Il2CppObject* go, Il2CppClass* cls) {
+    if (!go || !cls || !UI.GoGetComp) return nullptr;
+    Il2CppObject* type = IL2.TypeOf(cls);
+    if (!type) return nullptr;
+    void* a[1] = { type };
+    return IL2.Invoke(UI.GoGetComp, go, a);
 }
 
-static Il2CppObject *g_font = nullptr;
-static Il2CppObject *GetFont() {
-    if (g_font && Alive(g_font)) return g_font;
-    // Try Font.CreateDynamicFontFromOSFont
-    Il2CppClass *fontCls = UI.Font;
-    if (!fontCls) return nullptr;
-    MethodInfo *create = IL2.GetMethod(fontCls,"CreateDynamicFontFromOSFont",2);
-    if (create) {
-        int size=24;
-        void *a[2]={IL2.StrNew("Arial"),(void*)&size};
-        g_font = IL2.Invoke(create, nullptr, a);
-    }
-    if (!g_font || !Alive(g_font)) {
-        // Fallback: Resources.GetBuiltinResource<Font>("Arial.ttf")
-        if (UI.FontGetDefault) {
-            void *a[2]={(void*)fontCls,IL2.StrNew("Arial.ttf")};
-            g_font = IL2.Invoke(UI.FontGetDefault, nullptr, a);
-        }
-    }
-    return g_font;
-}
-
-// ---- Make a background image (cube quad) -----------------------------------
-static Il2CppObject *MakePanel(Il2CppObject *canvasGO, Vec2 size, Vec3 pos, Color c) {
-    Il2CppObject *go  = NewGO("Panel", canvasGO);
+// NewGO: construct, name, optionally parent. Returns owned raw pointer.
+static Il2CppObject* NewGO(const char* name, Il2CppObject* parent=nullptr) {
+    if (!UI.GameObject) return nullptr;
+    Il2CppObject* go = IL2.object_new(UI.GameObject);
     if (!go) return nullptr;
-    Il2CppObject *img = AddComp(go, UI.Image);
-    SetSD(go, size);
-    SetLP(go, {pos.x, pos.y, 0});
-    if (img && UI.ImageSetColor) { void*a[1]={&c}; IL2.Invoke(UI.ImageSetColor,img,a); }
+    MethodInfo* ctor1 = IL2.GetMethod(UI.GameObject, ".ctor", 1);
+    MethodInfo* ctor0 = IL2.GetMethod(UI.GameObject, ".ctor", 0);
+    if (ctor1) { void* a[1] = { IL2.StrNew(name) }; IL2.Invoke(ctor1, go, a); }
+    else if (ctor0) { IL2.Invoke(ctor0, go); }
+    if (parent) Parent(go, parent, false);
     return go;
 }
 
-// ---- Make a text label -----------------------------------------------------
-static Il2CppObject *MakeText(Il2CppObject *canvasGO, const char *str, Vec2 size, Vec3 pos,
-                               Color c={0.9f,0.9f,0.95f,1}, int fontSize=20, bool bold=false) {
-    Il2CppObject *go  = NewGO("Label", canvasGO);
-    if (!go) return nullptr;
-    Il2CppObject *txt = AddComp(go, UI.Text);
-    SetSD(go, size);
-    SetLP(go, {pos.x,pos.y,0});
-    if (txt) {
-        if (UI.TextSetText)     { void*a[1]={IL2.StrNew(str)};  IL2.Invoke(UI.TextSetText,txt,a); }
-        if (UI.TextSetFontSize) { void*a[1]={&fontSize};        IL2.Invoke(UI.TextSetFontSize,txt,a); }
-        if (UI.TextSetColor) {
-            Il2CppClass *graphic = IL2.GetClass("UnityEngine.UI","Graphic","UnityEngine.UI");
-            MethodInfo  *gc = graphic ? IL2.GetMethod(graphic,"set_color",1) : nullptr;
-            if (gc){ void*a[1]={&c}; IL2.Invoke(gc,txt,a); }
-        }
-        if (UI.TextSetFont) {
-            Il2CppObject *f=GetFont();
-            if(f){ void*a[1]={f}; IL2.Invoke(UI.TextSetFont,txt,a); }
-        }
-        if (UI.TextSetAlign) { int align=4; void*a[1]={&align}; IL2.Invoke(UI.TextSetAlign,txt,a); }
-        if (UI.TextSetBestFit)  { int v=1; void*a[1]={&v};  IL2.Invoke(UI.TextSetBestFit,txt,a); }
-        if (UI.TextSetMinSize)  { int v=8; void*a[1]={&v};  IL2.Invoke(UI.TextSetMinSize,txt,a); }
-        if (UI.TextSetMaxSize)  {          void*a[1]={&fontSize}; IL2.Invoke(UI.TextSetMaxSize,txt,a); }
+static Ref g_font;
+static Il2CppObject* GetFont() {
+    if (g_font && Alive(g_font.get())) return g_font.get();
+    if (!UI.Font) return nullptr;
+    // Preferred: dynamic OS font, always present on Quest.
+    if (UI.FontFromOSFont) {
+        int size = 24;
+        void* a[2] = { IL2.StrNew("Roboto"), &size };
+        Il2CppObject* f = IL2.Invoke(UI.FontFromOSFont, nullptr, a);
+        if (f) { g_font.set(f); return f; }
     }
-    return go;
-}
-
-// ---- Update text on a label GO ---------------------------------------------
-static Il2CppObject *GetTextComp(Il2CppObject *go) {
-    return Alive(go) ? GetComp(go, UI.Text) : nullptr;
-}
-static void SetText(Il2CppObject *go, const char *s) {
-    Il2CppObject *t=GetTextComp(go);
-    if (t&&UI.TextSetText){ void*a[1]={IL2.StrNew(s)}; IL2.Invoke(UI.TextSetText,t,a); }
-}
-static void SetPanelColor(Il2CppObject *go, Color c) {
-    Il2CppObject *img=GetComp(go,UI.Image);
-    if (img&&UI.ImageSetColor){ void*a[1]={&c}; IL2.Invoke(UI.ImageSetColor,img,a); }
+    // Fallback: builtin resource.
+    if (UI.ResourcesBuiltin && UI.Font && IL2.TypeOf(UI.Font)) {
+        void* a[2] = { IL2.TypeOf(UI.Font), IL2.StrNew("Arial.ttf") };
+        Il2CppObject* f = IL2.Invoke(UI.ResourcesBuiltin, nullptr, a);
+        if (f) { g_font.set(f); return f; }
+    }
+    LOGE("font unresolved — labels will render blank");
+    return nullptr;
 }
 
 // ============================================================================
-// Menu structure
+// Theme
 // ============================================================================
-// Window: 0.6m wide × 0.44m tall in world space (matches screenshot proportions)
-// Canvas scale: 1 unit = 1000 pixels (so sizeDelta in units maps to meters/1000)
-static constexpr float kW   = 600;  // canvas pixels wide
-static constexpr float kH   = 440;  // canvas pixels tall
-static constexpr float kTabH= 36;
-static constexpr float kTabY= (kH/2) - kTabH/2 - 42;  // below title area
-static constexpr float kContentTop = kTabY - kTabH/2 - 4;
-static constexpr float kRowH = 36;
-static constexpr float kCheckSize = 22;
-static constexpr float kSliderW = 160;
+static const Color kBg        {0.06f,0.06f,0.08f,0.97f};
+static const Color kPanel     {0.10f,0.10f,0.13f,1.00f};
+static const Color kPanelAlt  {0.14f,0.14f,0.18f,1.00f};
+static const Color kTabActive {0.30f,0.42f,0.72f,1.00f};
+static const Color kTabIdle   {0.16f,0.16f,0.20f,1.00f};
+static const Color kBtn       {0.18f,0.18f,0.24f,1.00f};
+static const Color kBtnHover  {0.34f,0.46f,0.74f,1.00f};
+static const Color kCheckOn   {0.32f,0.62f,0.94f,1.00f};
+static const Color kCheckOff  {0.20f,0.20f,0.26f,1.00f};
+static const Color kText      {0.92f,0.92f,0.96f,1.00f};
+static const Color kTextDim   {0.58f,0.60f,0.66f,1.00f};
+static const Color kTitle     {0.78f,0.88f,1.00f,1.00f};
+static const Color kSliderBg  {0.14f,0.14f,0.18f,1.00f};
+static const Color kSliderFill{0.34f,0.56f,0.94f,1.00f};
+static const Color kAccent    {0.42f,0.86f,1.00f,1.00f};
+static const Color kDanger    {0.90f,0.34f,0.38f,1.00f};
+static const Color kOk        {0.36f,0.88f,0.56f,1.00f};
 
+static void SetColor(Il2CppObject* go, Color c, Il2CppClass* compCls) {
+    if (!go) return;
+    Il2CppObject* comp = GetComp(go, compCls);
+    if (!comp || !UI.GraphicSetColor) return;
+    void* a[1] = { &c };
+    IL2.Invoke(UI.GraphicSetColor, comp, a);
+}
+
+// ============================================================================
+// Widgets
+// ============================================================================
+static Il2CppObject* MakePanel(Il2CppObject* parent, float w, float h, Vec3 pos, Color c) {
+    Il2CppObject* go = NewGO("Panel", parent);
+    if (!go) return nullptr;
+    Il2CppObject* img = AddComp(go, UI.Image);
+    Il2CppClass * cls = IL2.GetClass("UnityEngine","RectTransform","UnityEngine.CoreModule");
+    if (!cls) cls = UI.RectTransform;
+    if (img && cls) AddComp(go, cls);   // AddComponent<Image> adds RectTransform itself
+    SetSD(go, w, h);
+    SetLP(go, pos);
+    if (img && UI.GraphicSetColor) { void* a[1] = { &c }; IL2.Invoke(UI.GraphicSetColor, img, a); }
+    return go;
+}
+
+static Il2CppObject* MakeText(Il2CppObject* parent, const char* s, float w, float h,
+                              Vec3 pos, Color c, int fontSize, int align=4) {
+    Il2CppObject* go = NewGO("Label", parent);
+    if (!go) return nullptr;
+    Il2CppObject* txt = AddComp(go, UI.Text);
+    if (!txt) { Kill(go); return nullptr; }
+    SetSD(go, w, h);
+    SetLP(go, pos);
+    if (UI.TextSetText)     { void* a[1] = { IL2.StrNew(s) }; IL2.Invoke(UI.TextSetText, txt, a); }
+    if (UI.TextSetFontSize) { void* a[1] = { &fontSize };     IL2.Invoke(UI.TextSetFontSize, txt, a); }
+    if (UI.TextSetAlign)    { void* a[1] = { &align };        IL2.Invoke(UI.TextSetAlign, txt, a); }
+    if (UI.GraphicSetColor) { void* a[1] = { &c };            IL2.Invoke(UI.GraphicSetColor, txt, a); }
+    Il2CppObject* f = GetFont();
+    if (f && UI.TextSetFont) { void* a[1] = { f }; IL2.Invoke(UI.TextSetFont, txt, a); }
+    return go;
+}
+
+static void SetText(Il2CppObject* go, const char* s) {
+    Il2CppObject* t = GetComp(go, UI.Text);
+    if (!t || !UI.TextSetText) return;
+    void* a[1] = { IL2.StrNew(s) };
+    IL2.Invoke(UI.TextSetText, t, a);
+}
+static void SetTextColor(Il2CppObject* go, Color c) {
+    SetColor(go, c, UI.Text);
+}
+
+// ============================================================================
+// Row model
+// ============================================================================
 struct MenuRow {
-    const char *label;
-    bool       *flag;        // nullptr = action or header
-    void      (*action)();   // for action buttons
-    float      *sliderVal;   // nullptr = not a slider
-    float       sliderMin;
-    float       sliderMax;
-    Tab         tab;
-    // Runtime handles
-    Il2CppObject *rowGO    = nullptr;
-    Il2CppObject *checkGO  = nullptr;
-    Il2CppObject *labelGO  = nullptr;
-    Il2CppObject *sliderBgGO = nullptr;
-    Il2CppObject *sliderFillGO = nullptr;
+    const char* label   = "";
+    bool*       flag    = nullptr;
+    void      (*action)() = nullptr;
+    float*      slider  = nullptr;
+    float       lo      = 0;
+    float       hi      = 0;
+    Tab         tab     = TAB_PLAYER;
+
+    Ref rowGO{}, labelGO{}, checkGO{}, sliderBg{}, sliderFill{}, valueGO{}, checkMark{};
 };
-
-static float g_flySpeed  = 15.0f;
-static float g_flapMult  = 5.5f;
-
 static MenuRow g_rows[] = {
-    // TAB_PLAYER — Movement
-    {"Movement",         nullptr,      nullptr,            nullptr,         0,   0,   TAB_PLAYER},
-    {"Fly Speed",        nullptr,      nullptr,            &g_flySpeed,     1,   40,  TAB_PLAYER},
-    {"Flap Multiplier",  nullptr,      nullptr,            &g_flapMult,     1,   20,  TAB_PLAYER},
-    {"JFly",             &f_fly,       nullptr,            nullptr,         0,   0,   TAB_PLAYER},
-    {"Velocity Fly",     &f_velocityFly,nullptr,           nullptr,         0,   0,   TAB_PLAYER},
-    {"Platforms",        &f_platforms, nullptr,            nullptr,         0,   0,   TAB_PLAYER},
-    {"Noclip",           &f_noclip,    nullptr,            nullptr,         0,   0,   TAB_PLAYER},
-    {"Punch Mod",        &f_punch,     nullptr,            nullptr,         0,   0,   TAB_PLAYER},
-    {"Low Gravity",      &f_lowGravity,nullptr,            nullptr,         0,   0,   TAB_PLAYER},
-    {"No Gravity",       &f_noGravity, nullptr,            nullptr,         0,   0,   TAB_PLAYER},
-    {"Speed Hack",       &f_speed,     nullptr,            nullptr,         0,   0,   TAB_PLAYER},
-    {"Next Speed Tier",  nullptr,      Feature_NextSpeed,  nullptr,         0,   0,   TAB_PLAYER},
-    {"Spin",             &f_spin,      nullptr,            nullptr,         0,   0,   TAB_PLAYER},
-    {"Portal Gun",       &f_portalGun, nullptr,            nullptr,         0,   0,   TAB_PLAYER},
-    {"Save Spot",        nullptr,      Feature_SaveSpot,   nullptr,         0,   0,   TAB_PLAYER},
-    {"Go To Spot",       nullptr,      Feature_GoToSpot,   nullptr,         0,   0,   TAB_PLAYER},
+    // ---- Player ----
+    {"Movement",        nullptr,       nullptr,             nullptr,           0,   0,  TAB_PLAYER},
+    {"Fly Speed (m/s)", nullptr,       nullptr,             nullptr,           1,  40, TAB_PLAYER},
+    {"Flap Multiplier", nullptr,       nullptr,             nullptr,           1,  20, TAB_PLAYER},
+    {"Fly",             &f_fly,        nullptr,             nullptr,           0,   0,  TAB_PLAYER},
+    {"Velocity Fly",    &f_velocityFly,nullptr,             nullptr,           0,   0,  TAB_PLAYER},
+    {"Noclip",          &f_noclip,     nullptr,             nullptr,           0,   0,  TAB_PLAYER},
+    {"Punch Mod",       &f_punch,      nullptr,             nullptr,           0,   0,  TAB_PLAYER},
+    {"Low Gravity",     &f_lowGravity, nullptr,             nullptr,           0,   0,  TAB_PLAYER},
+    {"No Gravity",      &f_noGravity,  nullptr,             nullptr,           0,   0,  TAB_PLAYER},
+    {"Speed Hack",      &f_speed,      nullptr,             nullptr,           0,   0,  TAB_PLAYER},
+    {"Next Speed Tier", nullptr,       Feature_NextSpeed,   nullptr,           0,   0,  TAB_PLAYER},
+    {"Spin",            &f_spin,       nullptr,             nullptr,           0,   0,  TAB_PLAYER},
+    {"Portal Gun",      &f_portalGun,  nullptr,             nullptr,           0,   0,  TAB_PLAYER},
+    {"Save Spot",       nullptr,       Feature_SaveSpot,    nullptr,           0,   0,  TAB_PLAYER},
+    {"Go To Spot",      nullptr,       Feature_GoToSpot,    nullptr,           0,   0,  TAB_PLAYER},
 
-    // TAB_EXPLOITS
-    {"Exploits",         nullptr,      nullptr,            nullptr,         0,   0,   TAB_EXPLOITS},
-    {"Freeze Players",   &f_freeze,    nullptr,            nullptr,         0,   0,   TAB_EXPLOITS},
-    {"Punch Mod",        &f_punch,     nullptr,            nullptr,         0,   0,   TAB_EXPLOITS},
-    {"Big Head",         &f_bigHead,   nullptr,            nullptr,         0,   0,   TAB_EXPLOITS},
-    {"Invisible",        &f_invisible, nullptr,            nullptr,         0,   0,   TAB_EXPLOITS},
-    {"Name Spoof",       &f_nameSpoof, nullptr,            nullptr,         0,   0,   TAB_EXPLOITS},
-    {"Anti-EAC",         &f_antiEac,   nullptr,            nullptr,         0,   0,   TAB_EXPLOITS},
+    // ---- Exploits ----
+    {"Exploits",        nullptr,       nullptr,             nullptr,           0,   0,  TAB_EXPLOITS},
+    {"Freeze Players",  &f_freeze,     nullptr,             nullptr,           0,   0,  TAB_EXPLOITS},
+    {"Big Head",        &f_bigHead,    nullptr,             nullptr,           0,   0,  TAB_EXPLOITS},
+    {"Invisible",       &f_invisible,  nullptr,             nullptr,           0,   0,  TAB_EXPLOITS},
+    {"Name Spoof",      &f_nameSpoof,  nullptr,             nullptr,           0,   0,  TAB_EXPLOITS},
+    {"Anti-EAC",        &f_antiEac,    nullptr,             nullptr,           0,   0,  TAB_EXPLOITS},
 
-    // TAB_VISUAL
-    {"Visual",           nullptr,      nullptr,            nullptr,         0,   0,   TAB_VISUAL},
-    {"ESP",              &f_esp,       nullptr,            nullptr,         0,   0,   TAB_VISUAL},
-    {"Skybox",           &f_skybox,    nullptr,            nullptr,         0,   0,   TAB_VISUAL},
-    {"Rainbow Skybox",   &f_skyRainbow,nullptr,            nullptr,         0,   0,   TAB_VISUAL},
-    {"Next Sky Color",   nullptr,      Feature_NextSkyColor,nullptr,        0,   0,   TAB_VISUAL},
-    {"World Blocks",     &f_worldBlocks,nullptr,           nullptr,         0,   0,   TAB_VISUAL},
-    {"Rainbow Blocks",   &f_blockRainbow,nullptr,          nullptr,         0,   0,   TAB_VISUAL},
-    {"Orbit Cam",        &f_orbitCam,  nullptr,            nullptr,         0,   0,   TAB_VISUAL},
+    // ---- Visual ----
+    {"Visual",          nullptr,       nullptr,             nullptr,           0,   0,  TAB_VISUAL},
+    {"ESP",             &f_esp,        nullptr,             nullptr,           0,   0,  TAB_VISUAL},
+    {"Skybox",          &f_skybox,     nullptr,             nullptr,           0,   0,  TAB_VISUAL},
+    {"Rainbow Skybox",  &f_skyRainbow, nullptr,             nullptr,           0,   0,  TAB_VISUAL},
+    {"Next Sky Color",  nullptr,       Feature_NextSkyColor,nullptr,           0,   0,  TAB_VISUAL},
+    {"World Blocks",    &f_worldBlocks,nullptr,             nullptr,           0,   0,  TAB_VISUAL},
+    {"Rainbow Blocks",  &f_blockRainbow,nullptr,            nullptr,           0,   0,  TAB_VISUAL},
+    {"Orbit Cam",       &f_orbitCam,   nullptr,             nullptr,           0,   0,  TAB_VISUAL},
 
-    // TAB_PLAYERS — dynamic, populated at runtime
-    {"Players",          nullptr,      nullptr,            nullptr,         0,   0,   TAB_PLAYERS},
+    // ---- Players (dynamic rows built at runtime) ----
+    {"Players",         nullptr,       nullptr,             nullptr,           0,   0,  TAB_PLAYERS},
 
-    // TAB_SOUNDBOARD — 12 clips, populated at runtime in BuildMenu
+    // ---- Soundboard: control rows above the clip list ----
+    {"Soundboard",      nullptr,       nullptr,             nullptr,           0,   0,  TAB_SOUNDBOARD},
+    {"Play Broadcast",  nullptr,       Action_Broadcast,    nullptr,           0,   0,  TAB_SOUNDBOARD},
+    {"Stop All Audio",  nullptr,       Action_StopAudio,    nullptr,           0,   0,  TAB_SOUNDBOARD},
 
-    // TAB_TEXT
-    {"Text",             nullptr,      nullptr,            nullptr,         0,   0,   TAB_TEXT},
-    // (Text / chat tools require VRC's InputField hooks — stubs for now)
+    // ---- GunLib (lives in the Text slot so the tab strip stays 8 wide) ----
+    {"GunLib",          nullptr,       nullptr,             nullptr,           0,   0,  TAB_TEXT},
+    {"Crash Target",    nullptr,       Action_Crash,        nullptr,           0,   0,  TAB_TEXT},
+    {"Lag Room",        nullptr,       Action_Lag,          nullptr,           0,   0,  TAB_TEXT},
+    {"Kick Target",     nullptr,       Action_Kick,         nullptr,           0,   0,  TAB_TEXT},
+    {"Target: (none)",  nullptr,       nullptr,             nullptr,           0,   0,  TAB_TEXT},   // label updated live
 
-    // TAB_MISC
-    {"Misc",             nullptr,      nullptr,            nullptr,         0,   0,   TAB_MISC},
-    {"All Off",          nullptr,      Feature_AllOff,     nullptr,         0,   0,   TAB_MISC},
+    // ---- Misc ----
+    {"Misc",            nullptr,       nullptr,             nullptr,           0,   0,  TAB_MISC},
+    {"All Off",         nullptr,       Feature_AllOff,      nullptr,           0,   0,  TAB_MISC},
 
-    // TAB_CONFIG
-    {"Config",           nullptr,      nullptr,            nullptr,         0,   0,   TAB_CONFIG},
+    // ---- Config ----
+    {"Config",          nullptr,       nullptr,             nullptr,           0,   0,  TAB_CONFIG},
 };
-static constexpr int kRowCount = sizeof(g_rows)/sizeof(g_rows[0]);
+static constexpr int kRowCount = (int)(sizeof(g_rows)/sizeof(g_rows[0]));
 
-// ============================================================================
-// Menu scene objects
-// ============================================================================
-static Il2CppObject *g_menuRoot    = nullptr;  // parented to left hand
-static Il2CppObject *g_canvasGO    = nullptr;
-static Il2CppObject *g_bgPanel     = nullptr;
-static Il2CppObject *g_titleText   = nullptr;
-static Il2CppObject *g_fpsText     = nullptr;
-static Il2CppObject *g_dockBtn     = nullptr;
-static Il2CppObject *g_tabGOs[TAB_COUNT] = {};
-static Il2CppObject *g_tabTextGOs[TAB_COUNT] = {};
-static Il2CppObject *g_contentRoot = nullptr;
-static Il2CppObject *g_cursor      = nullptr;  // small sphere on right hand
+static constexpr float kW = 640.f, kH = 480.f;
+static constexpr float kTabH = 40.f;
+static constexpr float kTabY = kH/2 - 80.f;
+static constexpr float kContentTop = kTabY - kTabH/2 - 10.f;
+static constexpr float kRowH = 34.f;
+static constexpr float kRowW = kW - 24.f;
 
-static bool g_built = false;
+static Tab      g_activeTab = TAB_PLAYER;
+static bool     g_menuOpen  = false;
+static bool     g_docked    = false;
+static double   g_openAt    = 0;
+static bool     g_built     = false;
+
+static Ref g_root, g_canvas, g_bg, g_title, g_fpsTxt, g_dockBtn, g_dockTxt,
+           g_content, g_cursor, g_cursorDot, g_status;
+static Ref g_tabGO[TAB_COUNT], g_tabTxt[TAB_COUNT];
 static int  g_hoverRow = -1;
 static int  g_hoverTab = -1;
 static bool g_triggerWas = false;
-static double g_nextFpsUpdate = 0;
-static int  g_frameCount = 0;
-static float g_fps = 60.0f;
+static double g_nextFps = 0;
+static int  g_frames = 0;
+static float g_fps = 60.f;
+static double g_nextStatus = 0;
+
+// ---- Dynamic rows (Players / Soundboard) -----------------------------------
+// Built once at a per-tab slot and refreshed in place. Never reallocated while
+// the tab is open, so a label pointer cannot go stale mid-click.
+static constexpr int kDynMax = 32;
+struct DynRow {
+    Ref rowGO, labelGO, actionGO;
+    int playerIdx = -1;
+};
+static DynRow g_dyn[kDynMax];
+static int    g_dynCount = 0;
+
+static void BuildDynRow(int slot, const char* text, Color c) {
+    if (slot < 0 || slot >= kDynMax) return;
+    DynRow& d = g_dyn[slot];
+    if (!d.rowGO) {
+        d.rowGO    = MakePanel(g_content.get(), kRowW, kRowH-3, {0,0,0}, kPanel);
+        d.labelGO  = MakeText(g_content.get(), text, kRowW-30, kRowH-8, {0,0,-1}, c, 15, 3);
+    } else {
+        SetText(d.labelGO.get(), text);
+        SetTextColor(d.labelGO.get(), c);
+    }
+}
+
+static void UpdateDynRows() {
+    int n = 0;
+    if (g_activeTab == TAB_PLAYERS) {
+        int pc = (int)Feature_PlayerCount();
+        if (pc > kDynMax) pc = kDynMax;
+        for (int i=0;i<pc && n<kDynMax;i++) {
+            char buf[128];
+            snprintf(buf, sizeof buf, "%s  %.0fm%s",
+                     Feature_PlayerName(i), Feature_PlayerDist(i),
+                     Feature_PlayerIsLocal(i) ? "  (you)" : "");
+            BuildDynRow(n, buf, Feature_PlayerIsLocal(i) ? kTextDim : kText);
+            g_dyn[n].playerIdx = i;
+            n++;
+        }
+    } else if (g_activeTab == TAB_SOUNDBOARD) {
+        int sc = Soundboard::Count();
+        for (int i=0;i<sc && n<kDynMax;i++) {
+            BuildDynRow(n, Soundboard::Name(i), kText);
+            g_dyn[n].playerIdx = i;
+            n++;
+        }
+        if (g_soundStatus[0]) BuildDynRow(n++, g_soundStatus, kAccent);
+    }
+    // Park unused rows
+    for (int i=n;i<kDynMax;i++) {
+        if (g_dyn[i].rowGO) {
+            Show(g_dyn[i].rowGO.get(), false);
+            Show(g_dyn[i].labelGO.get(), false);
+        }
+    }
+    g_dynCount = n;
+
+    float y = -kRowH/2;
+    for (int i=0;i<n;i++) {
+        Show(g_dyn[i].rowGO.get(), true);
+        Show(g_dyn[i].labelGO.get(), true);
+        SetLP(g_dyn[i].rowGO.get(), {0,y,0});
+        SetLP(g_dyn[i].labelGO.get(), {0,y,-1});
+        y -= kRowH;
+    }
+}
 
 // ============================================================================
-// Build menu (called once after IL2CPP + UI classes are ready)
+// Scene objects
 // ============================================================================
+
+// Left/right hand transforms. Resolved from the local avatar's animator when
+// available; camera transform is the fallback so the menu is never unreachable.
+static Ref g_leftHand, g_rightHand;
+
+static void ResolveHands() {
+    if (g_leftHand && Alive(g_leftHand.get())) return;
+
+    // VRCPlayerApi -> gameObject -> transform is the reliable path. The
+    // animator's hand bones are named on the Unity humanoid rig.
+    Il2CppClass *animCls = IL2.GetClass("UnityEngine","Animator","UnityEngine.AnimationModule");
+    if (!animCls) animCls = IL2.GetClass("UnityEngine","Animator","UnityEngine");
+    Il2CppClass *hbc = IL2.GetClass("UnityEngine","HumanBodyBones","UnityEngine.AnimationModule");
+    if (!hbc) hbc = IL2.GetClass("UnityEngine","HumanBodyBones","UnityEngine");
+
+    // Fast path: VRChat exposes VRCPlayerApi.GetBoneTransform(HumanBodyBones).
+    Il2CppClass *api = IL2.GetClass("","VRCPlayerApi","Assembly-CSharp");
+    MethodInfo *getBone = api ? IL2.GetMethod(api,"GetBoneTransform",1) : nullptr;
+    Il2CppClass *net  = IL2.GetClass("","Networking","Assembly-CSharp");
+    MethodInfo *getLocal = net ? IL2.GetMethod(net,"get_LocalPlayer",0) : nullptr;
+
+    if (getBone && getLocal) {
+        Il2CppObject *local = IL2.Invoke(getLocal, nullptr);
+        if (local) {
+            // HumanBodyBones.LeftHand = 17, RightHand = 18 in Unity's enum.
+            int32_t left = 17, right = 18;
+            void* al[1] = { &left };
+            void* ar[1] = { &right };
+            Il2CppObject *lt = IL2.Invoke(getBone, local, al);
+            Il2CppObject *rt = IL2.Invoke(getBone, local, ar);
+            if (lt) g_leftHand.set(lt);
+            if (rt) g_rightHand.set(rt);
+        }
+    }
+    if (g_leftHand && g_rightHand) {
+        LOGI("hands bound via GetBoneTransform");
+        return;
+    }
+
+    // Fallback: camera. Menu still appears and is usable, just anchored to head.
+    Il2CppObject *cam = UI.CamGetMain ? IL2.Invoke(UI.CamGetMain, nullptr) : nullptr;
+    if (cam) {
+        Il2CppObject *camTr = Tr(cam);
+        if (camTr) { g_leftHand.set(camTr); g_rightHand.set(camTr); }
+        LOGI("hands fallback: camera");
+    }
+}
+
+// ============================================================================
+// Build
+// ============================================================================
+static void RebuildContent();
+
 static void BuildMenu() {
     if (!UI.ready) return;
-    LOGI("Building menu");
+    LOGI("building menu");
 
-    // Root GO — will be parented to left hand each frame
-    g_menuRoot = NewGO("VRCQuestMenu");
-    if (!g_menuRoot) { LOGE("menuRoot null"); return; }
-    SetLS(g_menuRoot, {1,1,1});
+    g_root = NewGO("DarkMatterRoot");
+    if (!g_root) { LOGE("root alloc failed"); return; }
+    SetLS(g_root.get(), {1,1,1});
 
-    // Canvas
-    g_canvasGO = NewGO("MenuCanvas", g_menuRoot);
-    if (!g_canvasGO) return;
-    Il2CppObject *canvas = AddComp(g_canvasGO, UI.Canvas);
-    if (canvas && UI.CanvasSetMode) { int mode=2; void*a[1]={&mode}; IL2.Invoke(UI.CanvasSetMode,canvas,a); } // World Space
-    SetSD(g_canvasGO, {kW, kH});
-    SetLS(g_canvasGO, {0.001f, 0.001f, 0.001f}); // 1 pixel = 1mm
-    SetLP(g_canvasGO, {0.1f, 0, 0}); // offset from hand
+    g_canvas = NewGO("DarkMatterCanvas", g_root.get());
+    if (!g_canvas) return;
+    Il2CppObject* canvas = AddComp(g_canvas.get(), UI.Canvas);
+    if (!canvas) { LOGE("canvas component failed"); return; }
+    if (UI.CanvasSetMode) { int mode = 2; void* a[1] = {&mode}; IL2.Invoke(UI.CanvasSetMode, canvas, a); }
+    Il2CppObject* cam = UI.CamGetMain ? IL2.Invoke(UI.CamGetMain, nullptr) : nullptr;
+    if (cam && UI.CanvasSetWorldCam) { void* a[1] = {cam}; IL2.Invoke(UI.CanvasSetWorldCam, canvas, a); }
+    SetSD(g_canvas.get(), kW, kH);
+    SetLS(g_canvas.get(), {0.001f, 0.001f, 0.001f});   // 1 px = 1 mm
 
-    // Background panel — dark, no animated elements
-    g_bgPanel = MakePanel(g_canvasGO, {kW, kH}, {0, 0, 0}, kBgColor);
+    g_bg = MakePanel(g_canvas.get(), kW, kH, {0,0,0}, kBg);
 
-    // Title: "Moony's Animal Company menu <3"  (from screenshot)
-    // We'll use "Dark Matter — VRChat Quest" matching the mod name
-    g_titleText = MakeText(g_canvasGO, "Dark Matter  |  VRChat Quest",
-                           {kW-20, 28}, {0, kH/2-18, -1}, kTitleColor, 22, true);
+    g_title = MakeText(g_canvas.get(), "Dark Matter", kW-260, 30,
+                       {-kW/2 + (kW-260)/2 + 10, kH/2-22, -1}, kTitle, 22, 3);
+    g_fpsTxt= MakeText(g_canvas.get(), "FPS 60", 140, 22,
+                       {kW/2-80, kH/2-22, -1}, kTextDim, 16, 5);
+    g_status= MakeText(g_canvas.get(), "", kW-40, 20,
+                       {0, kH/2-42, -1}, kAccent, 14, 3);
 
-    // FPS counter top-left
-    g_fpsText = MakeText(g_canvasGO, "FPS: 60.0",
-                         {120, 20}, {-kW/2+70, kH/2-36, -1}, kTextDim, 16);
-
-    // Dock button
-    g_dockBtn = MakePanel(g_canvasGO, {160, 28}, {-kW/2+88, kH/2-60, -1}, kBtnColor);
-    MakeText(g_canvasGO, "Dock in Front of Face", {155, 24}, {-kW/2+88, kH/2-60, -1}, kTextColor, 14);
+    g_dockBtn = MakePanel(g_canvas.get(), 200, 26, {-kW/2+110, kH/2-64, -1}, kBtn);
+    g_dockTxt = MakeText(g_canvas.get(), "Dock in Front of Face", 196, 22,
+                         {-kW/2+110, kH/2-64, -2}, kText, 14, 4);
 
     // Tab bar
     float tabW = kW / (float)TAB_COUNT;
-    for (int i=0;i<TAB_COUNT;i++) {
+    for (int i=0;i<TAB_COUNT;i++){
         float x = -kW/2 + tabW*(i+0.5f);
-        g_tabGOs[i] = MakePanel(g_canvasGO, {tabW-2, kTabH},
-                                {x, kTabY, -0.5f},
-                                i==g_activeTab ? kTabActive : kTabInactive);
-        g_tabTextGOs[i] = MakeText(g_canvasGO, kTabNames[i],
-                                   {tabW-4, kTabH-6}, {x, kTabY, -1},
-                                   kTextColor, 14);
+        g_tabGO[i] = MakePanel(g_canvas.get(), tabW-3, kTabH, {x, kTabY, -1},
+                               i==(int)g_activeTab ? kTabActive : kTabIdle);
+        g_tabTxt[i] = MakeText(g_canvas.get(), kTabNames[i], tabW-6, kTabH-8,
+                               {x, kTabY, -2}, kText, 14, 4);
     }
 
-    // Content root
-    g_contentRoot = NewGO("ContentRoot", g_canvasGO);
-    SetLP(g_contentRoot, {0, kContentTop, -1});
+    g_content = NewGO("Content", g_canvas.get());
+    SetLP(g_content.get(), {0, kContentTop, -2});
 
-    // Build rows
-    float y = 0;
-    for (int i=0;i<kRowCount;i++) {
-        MenuRow &row = g_rows[i];
-        if (row.tab != g_activeTab) continue;
+    // Cursor: a 12 mm quad, no image sprite, tinted so it reads on dark panels.
+    g_cursor = NewGO("Cursor", g_root.get());
+    if (g_cursor) {
+        g_cursorDot = MakePanel(g_cursor.get(), 8, 8, {0,0,0}, kAccent);
+        SetLS(g_cursor.get(), {0.002f,0.002f,0.002f});
+    }
 
-        // Row background
-        row.rowGO = MakePanel(g_contentRoot, {kW-20, kRowH-2}, {0, y, 0}, kPanelColor);
-
-        bool isHeader  = !row.flag && !row.action && !row.sliderVal;
-        bool isSlider  = row.sliderVal != nullptr;
-        bool isToggle  = row.flag != nullptr;
-        bool isAction  = row.action != nullptr;
-
-        if (isHeader) {
-            // Section header — slightly brighter, label only
-            SetPanelColor(row.rowGO, {0.15f,0.15f,0.20f,1});
-            MakeText(g_contentRoot, row.label, {kW-30, kRowH-6}, {0, y, -0.5f}, kTitleColor, 16, true);
-        } else if (isSlider) {
-            MakeText(g_contentRoot, row.label, {180, kRowH-6}, {kW/2-200/2-20, y, -0.5f}, kTextColor, 15);
-            // Slider background
-            row.sliderBgGO = MakePanel(g_contentRoot, {kSliderW, 10}, {-50, y, -0.5f}, kSliderBg);
-            // Slider fill (width = fraction of range)
-            float frac = (*row.sliderVal - row.sliderMin) / (row.sliderMax - row.sliderMin);
-            row.sliderFillGO = MakePanel(g_contentRoot, {kSliderW*frac+2, 10}, {-50-kSliderW/2+kSliderW*frac/2, y, -1}, kSliderFill);
-            // Value label
-            char buf[32]; snprintf(buf,sizeof buf,"%.3f",*row.sliderVal);
-            row.labelGO = MakeText(g_contentRoot, buf, {80, kRowH-6}, {50, y, -0.5f}, kTextDim, 15);
-        } else if (isToggle) {
-            // Checkbox
-            bool on = *row.flag;
-            row.checkGO = MakePanel(g_contentRoot, {kCheckSize, kCheckSize}, {-kW/2+20, y, -0.5f}, on?kCheckOn:kCheckOff);
-            if (on) MakeText(g_contentRoot,"✓",{kCheckSize,kCheckSize},{-kW/2+20,y,-1},kTextColor,14);
-            row.labelGO = MakeText(g_contentRoot, row.label, {kW-60, kRowH-6}, {10, y, -0.5f}, kTextColor, 16);
-        } else if (isAction) {
-            SetPanelColor(row.rowGO, kBtnColor);
-            row.labelGO = MakeText(g_contentRoot, row.label, {kW-30, kRowH-6}, {0, y, -0.5f}, kTextColor, 16);
+    // Pre-create one row per menu entry; visibility flips with the tab.
+    for (int i=0;i<kRowCount;i++){
+        MenuRow& r = g_rows[i];
+        bool isHeader = !r.flag && !r.action && !r.slider;
+        bool isSlider = r.slider != nullptr || (i==1 || i==2);   // two live sliders
+        r.rowGO = MakePanel(g_content.get(), kRowW, kRowH-3, {0,0,0},
+                            isHeader ? kPanelAlt : kPanel);
+        if (isSlider) {
+            r.labelGO   = MakeText(g_content.get(), r.label, 220, kRowH-8, {0,0,-1}, kText, 15, 3);
+            r.sliderBg  = MakePanel(g_content.get(), 170, 12, {0,0,-1}, kSliderBg);
+            r.sliderFill= MakePanel(g_content.get(), 170, 12, {0,0,-2}, kSliderFill);
+            r.valueGO   = MakeText(g_content.get(), "", 70, kRowH-8, {0,0,-1}, kTextDim, 14, 5);
+        } else if (r.flag) {
+            r.checkGO   = MakePanel(g_content.get(), 20, 20, {0,0,-1}, *r.flag ? kCheckOn : kCheckOff);
+            r.checkMark = MakeText(g_content.get(), "x", 16, 16, {0,0,-2}, kText, 13, 4);
+            r.labelGO   = MakeText(g_content.get(), r.label, kRowW-70, kRowH-8, {0,0,-1}, kText, 15, 3);
+        } else {
+            r.labelGO   = MakeText(g_content.get(), r.label, kRowW-24, kRowH-8, {0,0,-1},
+                                   isHeader ? kTitle : kText, isHeader ? 16 : 15, 3);
         }
-        y -= kRowH;
+        Show(r.rowGO.get(), false);
+        Show(r.labelGO.get(), false);
+        Show(r.checkGO.get(), false);
+        Show(r.checkMark.get(), false);
+        Show(r.sliderBg.get(), false);
+        Show(r.sliderFill.get(), false);
+        Show(r.valueGO.get(), false);
     }
 
-    // Cursor — small sphere on right hand
-    Il2CppClass *go = UI.GameObject;
-    if (go) {
-        g_cursor = NewGO("Cursor");
-        if (g_cursor) {
-            // Add a small image component as a dot
-            Il2CppObject *img = AddComp(g_cursor, UI.Image);
-            SetLS(g_cursor, {0.015f,0.015f,0.015f});
-            if (img && UI.ImageSetColor){ Color c={0.5f,0.8f,1,1}; void*a[1]={&c}; IL2.Invoke(UI.ImageSetColor,img,a); }
-        }
-    }
-
-    Show(g_menuRoot, false);
+    Show(g_root.get(), false);
     g_built = true;
-    LOGI("Menu built");
+    LOGI("menu built");
+    RebuildContent();
 }
 
 // ============================================================================
-// Rebuild content area when tab changes
+// Content layout
 // ============================================================================
+static void LayoutRow(MenuRow& r, int i, float y) {
+    bool isHeader = !r.flag && !r.action && !r.slider;
+    SetLP(r.rowGO.get(), {0,y,0});
+    SetLP(r.labelGO.get(), {-kRowW/2 + 14 + 110, y, -1});   // placeholder, refined below
+
+    if (r.slider || i==1 || i==2) {
+        SetLP(r.labelGO.get(), {-kRowW/2 + 130, y, -1});
+        SetLP(r.sliderBg.get(), {kRowW/2 - 240, y, -1});
+        SetLP(r.sliderFill.get(), {kRowW/2 - 240, y, -2});
+        SetLP(r.valueGO.get(), {kRowW/2 - 60, y, -1});
+    } else if (r.flag) {
+        SetLP(r.checkGO.get(), {-kRowW/2 + 22, y, -1});
+        SetLP(r.checkMark.get(), {-kRowW/2 + 22, y, -2});
+        SetLP(r.labelGO.get(), {10, y, -1});
+    } else {
+        SetLP(r.labelGO.get(), {isHeader ? 0 : 0, y, -1});
+    }
+}
+
 static void RebuildContent() {
-    if (!g_contentRoot) return;
-    // Hide all rows not in active tab, show those that are
-    float y = 0;
-    for (int i=0;i<kRowCount;i++) {
-        MenuRow &row = g_rows[i];
-        bool vis = (row.tab == g_activeTab);
-        Show(row.rowGO, vis);
-        Show(row.labelGO, vis);
-        Show(row.checkGO, vis);
-        Show(row.sliderBgGO, vis);
-        Show(row.sliderFillGO, vis);
-        if (vis) {
-            // Reposition
-            SetLP(row.rowGO, {0,y,0});
-            if (row.labelGO)      SetLP(row.labelGO,{10,y,-0.5f});
-            if (row.checkGO)      SetLP(row.checkGO,{-kW/2+20,y,-0.5f});
-            if (row.sliderBgGO)   SetLP(row.sliderBgGO,{-50,y,-0.5f});
-            if (row.sliderFillGO) SetLP(row.sliderFillGO,{-50,y,-1});
-            y -= kRowH;
+    if (!g_content) return;
+    float y = -kRowH/2;
+    for (int i=0;i<kRowCount;i++){
+        MenuRow& r = g_rows[i];
+        bool vis = (r.tab == g_activeTab);
+        if (vis && r.tab == TAB_PLAYERS) {
+            // Players tab: one row per player, built on demand
+            Show(r.rowGO.get(), false);
+            Show(r.labelGO.get(), false);
+            continue;
         }
-    }
-    // Update tab colors
-    for (int i=0;i<TAB_COUNT;i++)
-        SetPanelColor(g_tabGOs[i], i==g_activeTab?kTabActive:kTabInactive);
-}
+        Show(r.rowGO.get(), vis);
+        Show(r.labelGO.get(), vis);
+        Show(r.checkGO.get(), vis);
+        Show(r.checkMark.get(), vis);
+        Show(r.sliderBg.get(), vis);
+        Show(r.sliderFill.get(), vis);
+        Show(r.valueGO.get(), vis);
+        if (!vis) continue;
 
-// ============================================================================
-// Place menu on left hand each frame
-// ============================================================================
-static Il2CppObject *g_leftHandTr  = nullptr;
-static Il2CppObject *g_rightHandTr = nullptr;
-
-static void UpdateHandRefs() {
-    // Try to find the hand transforms via VRCPlayer or XR node transforms
-    if (g_leftHandTr && Alive(g_leftHandTr)) return;
-    Il2CppClass *vrcPlayer = IL2.GetClass("","VRCPlayer","Assembly-CSharp");
-    if (!vrcPlayer) return;
-    // VRCPlayer stores left/right hand refs — try common field names
-    static const char *leftNames[]  = {"leftHandTransform","leftHand","_leftHandTr",nullptr};
-    static const char *rightNames[] = {"rightHandTransform","rightHand","_rightHandTr",nullptr};
-    // Field scan: iterate IL2CPP fields
-    // For now, fall back to Camera as anchor (always works)
-    if (!g_leftHandTr) {
-        Il2CppClass *cam = IL2.GetClass("UnityEngine","Camera","UnityEngine");
-        MethodInfo  *getMain = cam ? IL2.GetMethod(cam,"get_main",0) : nullptr;
-        if (getMain) g_leftHandTr  = IL2.Invoke(getMain, nullptr);
-        if (getMain) g_rightHandTr = IL2.Invoke(getMain, nullptr);
-    }
-}
-
-static void PlaceMenu() {
-    UpdateHandRefs();
-    if (!g_menuRoot || !Alive(g_menuRoot)) return;
-    Il2CppObject *anchor = g_docked ? g_leftHandTr : g_leftHandTr; // both same for now
-    if (!anchor || !UI.TrGetPos || !UI.TrSetPos || !UI.TrGetRot || !UI.TrSetRot) return;
-
-    // Parent menu root to anchor transform
-    Il2CppObject *rootTr = Tr(g_menuRoot);
-    Il2CppObject *anchorTr = anchor;
-    // Set position to anchor + offset
-    Vec3 pos = IL2.Unbox<Vec3>(IL2.Invoke(UI.TrGetPos, anchorTr));
-    pos.y += 0.15f;
-    pos.x += g_docked ? 0 : 0.1f;
-    void *a[1]={&pos}; IL2.Invoke(UI.TrSetPos, rootTr, a);
-    // Match rotation of anchor
-    Quat rot = IL2.Unbox<Quat>(IL2.Invoke(UI.TrGetRot, anchorTr));
-    void *b[1]={&rot}; IL2.Invoke(UI.TrSetRot, rootTr, b);
-}
-
-// ============================================================================
-// Cursor — place on right hand, detect hover + click
-// ============================================================================
-static void UpdateCursor() {
-    if (!g_cursor || !Alive(g_cursor)) return;
-    if (!g_rightHandTr) return;
-    Vec3 rp = IL2.Unbox<Vec3>(IL2.Invoke(UI.TrGetPos, g_rightHandTr));
-    // The cursor just follows right hand position for now
-    Il2CppObject *ct = Tr(g_cursor);
-    if (ct && UI.TrSetPos){ void*a[1]={&rp}; IL2.Invoke(UI.TrSetPos,ct,a); }
-}
-
-// Detect which row the cursor is hovering
-static int HitTestRow() {
-    if (!g_canvasGO || !Alive(g_canvasGO) || !g_rightHandTr) return -1;
-    Vec3 cursorWS = IL2.Unbox<Vec3>(IL2.Invoke(UI.TrGetPos, g_rightHandTr));
-    // Transform cursor into canvas local space
-    Il2CppObject *canvasTr = Tr(g_canvasGO);
-    if (!canvasTr || !UI.TrGetPos) return -1;
-    Vec3 canvasPos = IL2.Unbox<Vec3>(IL2.Invoke(UI.TrGetPos, canvasTr));
-    Vec3 d = cursorWS - canvasPos;
-    // Convert to pixel coords (canvas scale 0.001)
-    float px = d.x / 0.001f;
-    float py = d.y / 0.001f;
-    // Check tabs
-    float tabW = kW / (float)TAB_COUNT;
-    if (fabsf(py - kTabY) < kTabH/2) {
-        int t = (int)((px + kW/2) / tabW);
-        if (t>=0&&t<TAB_COUNT) return -(t+2); // negative = tab index + 2
-    }
-    // Check dock button
-    if (fabsf(px-(-kW/2+88)) < 80 && fabsf(py-(kH/2-60)) < 14) return -1; // dock button
-    // Check rows
-    float y = kContentTop;
-    int row = -100;
-    for (int i=0;i<kRowCount;i++) {
-        if (g_rows[i].tab != g_activeTab) continue;
-        if (fabsf(py - y) < kRowH/2 && fabsf(px) < kW/2-10) { row = i; break; }
+        // Slider rows are indices 1 and 2; resolve the float pointer late so the
+        // menu reflects the live value rather than a snapshot.
+        float* val = (i==1) ? Feature_FlySpeedPtr() : (i==2 ? Feature_FlapMultPtr() : nullptr);
+        if (val && r.sliderFill) {
+            float lo = r.lo, hi = r.hi;
+            float frac = (hi > lo) ? (*val - lo) / (hi - lo) : 0.f;
+            if (frac < 0) frac = 0;
+            if (frac > 1) frac = 1;
+            Vec2 sd{ 170.f * frac + 2.f, 12.f };
+            Il2CppObject* fillTr = Tr(r.sliderFill.get());
+            if (fillTr && UI.RtSetSD) { void* a[1] = {&sd}; IL2.Invoke(UI.RtSetSD, fillTr, a); }
+            SetLP(r.sliderFill.get(), { kRowW/2 - 240 - 170/2 + 170*frac/2, y, -2 });
+            char buf[32]; snprintf(buf, sizeof buf, "%.1f", *val);
+            SetText(r.valueGO.get(), buf);
+        }
+        if (r.flag) {
+            SetColor(r.checkGO.get(), *r.flag ? kCheckOn : kCheckOff, UI.Image);
+            SetText(r.checkMark.get(), *r.flag ? "x" : "");
+        }
+        LayoutRow(r, i, y);
         y -= kRowH;
     }
-    return row;
-}
-
-static bool Trigger() {
-    if (!UI.Input || !UI.InputGetButton) return false;
-    bool r = false;
-    // Right trigger
-    const char *ax = "Oculus_CrossPlatform_SecondaryIndexTrigger";
-    Il2CppClass *input = UI.Input;
-    MethodInfo  *getAxis = IL2.GetMethod(input, "GetAxis", 1);
-    if (getAxis){ void*a[1]={IL2.StrNew(ax)}; Il2CppObject*o=IL2.Invoke(getAxis,nullptr,a); r=o&&IL2.Unbox<float>(o)>0.7f; }
-    return r;
+    for (int i=0;i<TAB_COUNT;i++)
+        SetColor(g_tabGO[i].get(), i==(int)g_activeTab ? kTabActive : kTabIdle, UI.Image);
+    UpdateDynRows();
+    // GunLib target row reflects the current selection
+    for (int i=0;i<kRowCount;i++) {
+        if (g_rows[i].tab == TAB_TEXT && strstr(g_rows[i].label, "Target:")) {
+            SetText(g_rows[i].labelGO.get(), g_gunTargetLabel);
+        }
+    }
 }
 
 // ============================================================================
-// Update loop
+// Placement
 // ============================================================================
-void Menu_Init() {
-    LOGI("Menu init");
+static void PlaceMenu() {
+    ResolveHands();
+    if (!g_root || !g_root.alive()) return;
+    Il2CppObject* anchor = g_docked ? g_rightHand.get() : g_leftHand.get();
+    if (!anchor) return;
+    Il2CppObject* anchorTr = Tr(anchor);
+    if (!anchorTr) return;
+    Il2CppObject* rootTr = Tr(g_root.get());
+    if (!rootTr) return;
+
+    Vec3 pos = IL2.Unbox<Vec3>(IL2.Invoke(UI.TrGetPos, anchorTr));
+    Quat rot = IL2.Unbox<Quat>(IL2.Invoke(UI.TrGetRot, anchorTr));
+
+    if (g_docked) {
+        // 0.55 m in front of the face, facing back at the head.
+        Vec3 fwd = { 0, 0, 1 };
+        // Unity forward is +Z; use the head's forward.
+        Vec3 headFwd = V3Norm(Vec3{ (rot.x*rot.z + rot.w*rot.y)*2,
+                                     (rot.y*rot.z - rot.w*rot.x)*2,
+                                     1 - 2*(rot.x*rot.x + rot.y*rot.y) });
+        (void)fwd;
+        pos = pos + headFwd * 0.55f;
+        rot = Quat{ rot.x, rot.y, rot.z, rot.w };
+    } else {
+        pos = pos + Vec3{0.03f, 0.12f, 0.02f};
+    }
+
+    void* a[1] = { &pos };
+    IL2.Invoke(UI.TrSetPos, rootTr, a);
+    void* b[1] = { &rot };
+    IL2.Invoke(UI.TrSetRot, rootTr, b);
 }
+
+static void UpdateCursor() {
+    if (!g_cursor || !g_cursor.alive()) return;
+    ResolveHands();
+    Il2CppObject* hand = g_rightHand.get();
+    if (!hand) return;
+    Il2CppObject* handTr = Tr(hand);
+    if (!handTr) return;
+    Vec3 p = IL2.Unbox<Vec3>(IL2.Invoke(UI.TrGetPos, handTr));
+    Il2CppObject* ctr = Tr(g_cursor.get());
+    if (!ctr) return;
+    void* a[1] = { &p };
+    IL2.Invoke(UI.TrSetPos, ctr, a);
+}
+
+static Vec3 g_cursorWS{};   // world-space cursor position, refreshed each frame
+
+// Transform a world point into canvas pixel space using the canvas transform.
+static bool WorldToCanvas(Vec3 world, Vec2& outPx) {
+    // Simple orthographic projection along the canvas forward:
+    // px = (P - C) · right ; py = (P - C) · up
+    Il2CppObject* canvasTr = Tr(g_canvas.get());
+    if (!canvasTr) return false;
+    Vec3 c   = IL2.Unbox<Vec3>(IL2.Invoke(UI.TrGetPos, canvasTr));
+    Quat q   = IL2.Unbox<Quat>(IL2.Invoke(UI.TrGetRot, canvasTr));
+    // Build basis from quaternion.
+    float x2=q.x+q.x, y2=q.y+q.y, z2=q.z+q.z;
+    float xx=q.x*x2, xy=q.x*y2, xz=q.x*z2;
+    float yy=q.y*y2, yz=q.y*z2, zz=q.z*z2;
+    float wx=q.w*x2, wy=q.w*y2, wz=q.w*z2;
+    Vec3 right { 1-(yy+zz), xy+wz,     xz-wy };
+    Vec3 up    { xy-wz,     1-(xx+zz), yz+wx };
+    Vec3 d = world - c;
+    outPx.x =  V3Dot(d, right) / 0.001f;   // canvas localScale is 0.001
+    outPx.y =  V3Dot(d, up)    / 0.001f;
+    return true;
+}
+
+// Hit test in canvas pixels.
+// returns: -100 = none, -2..-2-TAB_COUNT-1 = tab index (as -(i+2)), >=0 row index
+static int HitTest(const Vec2& px) {
+    // Tabs
+    float tabW = kW / (float)TAB_COUNT;
+    if (fabsf(px.y - kTabY) < kTabH/2) {
+        int t = (int)((px.x + kW/2) / tabW);
+        if (t >= 0 && t < TAB_COUNT) return -(t + 2);
+    }
+    // Dock button
+    if (fabsf(px.x - (-kW/2+110)) < 100 && fabsf(px.y - (kH/2-64)) < 13) return -1;
+    // Rows: walk the same layout positions RebuildContent produced
+    float y = -kRowH/2;
+    for (int i=0;i<kRowCount;i++){
+        MenuRow& r = g_rows[i];
+        if (r.tab != g_activeTab) continue;
+        if (fabsf(px.y - y) < kRowH/2 && fabsf(px.x) < kRowW/2) return i;
+        y -= kRowH;
+    }
+    // Dynamic rows live below the static block on Players / Soundboard
+    // Return -(1000 + index) so the click handler can tell them apart.
+    for (int i=0;i<g_dynCount;i++){
+        if (fabsf(px.y - y) < kRowH/2 && fabsf(px.x) < kRowW/2) return -(1000 + i);
+        y -= kRowH;
+    }
+    return -100;
+}
+
+static bool Trigger() { return Feature_RTrigger(); }
+
+// Slider drag: while a slider row is held, right stick Y nudges it.
+static void DragSlider(int rowIdx) {
+    if (rowIdx < 0 || rowIdx >= kRowCount) return;
+    MenuRow& r = g_rows[rowIdx];
+    float* val = (rowIdx==1) ? Feature_FlySpeedPtr() : (rowIdx==2 ? Feature_FlapMultPtr() : nullptr);
+    if (!val) return;
+    float delta = Feature_RAxisY() * 0.6f * g_dt * (r.hi - r.lo);
+    *val += delta;
+    if (*val < r.lo) *val = r.lo;
+    if (*val > r.hi) *val = r.hi;
+    RebuildContent();
+}
+
+// ============================================================================
+// Tick
+// ============================================================================
+void Menu_Init() { LOGI("menu init"); }
 
 void Menu_Update() {
     if (!InitUI()) return;
     if (!g_built) { BuildMenu(); return; }
 
-    // FPS counter
-    g_frameCount++;
-    if (g_time >= g_nextFpsUpdate) {
-        g_fps = g_frameCount / (float)(g_time - (g_nextFpsUpdate - 1.0));
-        if (g_fps > 999) g_fps = 999;
-        g_frameCount = 0;
-        g_nextFpsUpdate = g_time + 1.0;
-        char buf[32]; snprintf(buf,sizeof buf,"FPS: %.1f",g_fps);
-        SetText(g_fpsText, buf);
+    // FPS
+    g_frames++;
+    if (g_time >= g_nextFps) {
+        g_fps = (float)g_frames / (float)(g_time - (g_nextFps - 1.0));
+        if (g_fps > 999.f) g_fps = 999.f;
+        if (g_fps < 0.f)   g_fps = 0.f;
+        g_frames = 0; g_nextFps = g_time + 1.0;
+        char buf[32]; snprintf(buf, sizeof buf, "FPS %.0f", g_fps);
+        SetText(g_fpsTxt.get(), buf);
     }
 
-    // Open / close on left stick click
+    // Status line: photon state + room size
+    if (g_time >= g_nextStatus) {
+        g_nextStatus = g_time + 1.0;
+        char buf[96];
+        snprintf(buf, sizeof buf, "photon %s   players %d   soundboard %d",
+                 Photon::Ready() ? "ok" : "down",
+                 Photon::PlayerCount(), Soundboard::Count());
+        SetText(g_status.get(), buf);
+    }
+
     if (Feature_LeftStickClick()) {
         g_menuOpen = !g_menuOpen;
-        Show(g_menuRoot, g_menuOpen);
-        if (g_menuOpen) g_openAt = g_time;
-        LOGI("Menu %s", g_menuOpen?"OPEN":"CLOSED");
+        Show(g_root.get(), g_menuOpen);
+        if (g_menuOpen) { g_openAt = g_time; RebuildContent(); }
+        LOGI("menu %s", g_menuOpen ? "OPEN" : "CLOSED");
     }
     if (!g_menuOpen) return;
 
     PlaceMenu();
     UpdateCursor();
 
-    // Hit test
-    int hit = HitTestRow();
+    // Cursor world position comes from the hand transform
+    if (g_rightHand) {
+        Il2CppObject* handTr = Tr(g_rightHand.get());
+        if (handTr) g_cursorWS = IL2.Unbox<Vec3>(IL2.Invoke(UI.TrGetPos, handTr));
+    }
+
+    Vec2 px;
+    int hit = WorldToCanvas(g_cursorWS, px) ? HitTest(px) : -100;
+
+    if (hit != g_hoverRow) {
+        if (g_hoverRow <= -1000) {
+            int d = -(g_hoverRow + 1000);
+            if (d >= 0 && d < kDynMax && g_dyn[d].rowGO)
+                SetColor(g_dyn[d].rowGO.get(), kPanel, UI.Image);
+        }
+        if (g_hoverRow >= 0 && g_hoverRow < kRowCount) {
+            MenuRow& old = g_rows[g_hoverRow];
+            bool hdr = !old.flag && !old.action && !old.slider;
+            SetColor(old.rowGO.get(), hdr ? kPanelAlt : kPanel, UI.Image);
+        }
+        if (hit >= 0 && hit < kRowCount) {
+            SetColor(g_rows[hit].rowGO.get(), kBtnHover, UI.Image);
+        }
+        if (hit <= -1000) {
+            int d = -(hit + 1000);
+            if (d >= 0 && d < kDynMax && g_dyn[d].rowGO)
+                SetColor(g_dyn[d].rowGO.get(), kBtnHover, UI.Image);
+        }
+        g_hoverRow = hit;
+    }
+    if (hit < -1) {
+        int t = -(hit + 2);
+        if (t != g_hoverTab) {
+            if (g_hoverTab >= 0) SetColor(g_tabGO[g_hoverTab].get(),
+                                          g_hoverTab==(int)g_activeTab ? kTabActive : kTabIdle, UI.Image);
+            if (t >= 0 && t < TAB_COUNT && t != (int)g_activeTab)
+                SetColor(g_tabGO[t].get(), kBtnHover, UI.Image);
+            g_hoverTab = t;
+        }
+    }
+
     bool trig = Trigger();
     bool trigDown = trig && !g_triggerWas;
     g_triggerWas = trig;
 
-    // Highlight hover
-    if (hit != g_hoverRow) {
-        // De-highlight old
-        if (g_hoverRow >= 0 && g_hoverRow < kRowCount)
-            SetPanelColor(g_rows[g_hoverRow].rowGO, kPanelColor);
-        // Highlight new
-        if (hit >= 0 && hit < kRowCount)
-            SetPanelColor(g_rows[hit].rowGO, kBtnHover);
-        g_hoverRow = hit;
-    }
-
     if (!trigDown) return;
 
-    // Dock button (hit == -1)
-    if (hit == -1) {
-        g_docked = !g_docked;
+    if (hit == -1) { g_docked = !g_docked; LOGI("dock %d", g_docked); return; }
+
+    if (hit <= -1000) {
+        int d = -(hit + 1000);
+        if (d < 0 || d >= g_dynCount) return;
+        if (g_activeTab == TAB_PLAYERS) {
+            SetGunTarget(g_dyn[d].playerIdx);        // select as gun target
+            RebuildContent();
+        } else if (g_activeTab == TAB_SOUNDBOARD) {
+            int clip = g_dyn[d].playerIdx;
+            if (clip >= 0 && clip < Soundboard::Count()) {
+                g_soundSel = clip;
+                Soundboard::PlayLocal(clip);          // click = hear it
+                LOGI("soundboard: local play %d", clip);
+            }
+        }
         return;
     }
 
-    // Tab click (hit < -1)
     if (hit < -1) {
-        int tabIdx = -(hit+2);
-        if (tabIdx>=0 && tabIdx<TAB_COUNT) {
-            g_activeTab = (Tab)tabIdx;
+        int t = -(hit + 2);
+        if (t >= 0 && t < TAB_COUNT) {
+            g_activeTab = (Tab)t;
+            g_hoverRow = -1;
             RebuildContent();
         }
         return;
     }
 
-    // Row click
     if (hit >= 0 && hit < kRowCount) {
-        MenuRow &row = g_rows[hit];
-        // Toggle
-        if (row.flag) {
-            *row.flag = !*row.flag;
-            // Update checkbox color
-            SetPanelColor(row.checkGO, *row.flag ? kCheckOn : kCheckOff);
-            SetText(row.checkGO, *row.flag ? "✓" : "");
-            LOGI("Toggle %s = %d", row.label, *row.flag?1:0);
+        MenuRow& r = g_rows[hit];
+        bool isHeader = !r.flag && !r.action && !r.slider;
+        if (isHeader) return;
+        if (hit == 1 || hit == 2) { DragSlider(hit); return; }
+        if (r.flag) {
+            *r.flag = !*r.flag;
+            SetColor(r.checkGO.get(), *r.flag ? kCheckOn : kCheckOff, UI.Image);
+            SetText(r.checkMark.get(), *r.flag ? "x" : "");
+            LOGI("toggle %s = %d", r.label, *r.flag ? 1 : 0);
+            return;
         }
-        // Action
-        if (row.action) {
-            row.action();
-        }
-        // Slider: handled via right stick Y axis (held + axis)
-        if (row.sliderVal) {
-            float delta = Feature_RAxisY() * 0.5f * g_dt;
-            *row.sliderVal = fmaxf(row.sliderMin, fminf(row.sliderMax, *row.sliderVal + delta));
-            char buf[32]; snprintf(buf,sizeof buf,"%.3f",*row.sliderVal);
-            SetText(row.labelGO, buf);
-            // Update fill width
-            float frac = (*row.sliderVal - row.sliderMin) / (row.sliderMax - row.sliderMin);
-            if (Alive(row.sliderFillGO)) {
-                Vec2 sd = {kSliderW*frac+2, 10};
-                SetSD(row.sliderFillGO, sd);
-                SetLP(row.sliderFillGO, {-50-kSliderW/2+kSliderW*frac/2, 0, -1});
-            }
-        }
-        // Soundboard tab: play clip
-        if (g_activeTab == TAB_SOUNDBOARD) {
-            Soundboard_Play(hit); // row index maps to clip index in soundboard tab
-        }
+        if (r.action) { r.action(); RebuildContent(); }
     }
+}
+
+void Menu_Shutdown() {
+    // Explicit teardown: UI objects first, references released after.
+    for (int i=0;i<kRowCount;i++) {
+        MenuRow& r = g_rows[i];
+        r.rowGO.clear(); r.labelGO.clear(); r.checkGO.clear();
+        r.sliderBg.clear(); r.sliderFill.clear(); r.valueGO.clear(); r.checkMark.clear();
+    }
+    for (int i=0;i<TAB_COUNT;i++){ g_tabGO[i].clear(); g_tabTxt[i].clear(); }
+    g_cursorDot.clear(); g_cursor.clear();
+    g_status.clear(); g_dockTxt.clear(); g_dockBtn.clear();
+    g_content.clear(); g_fpsTxt.clear(); g_title.clear(); g_bg.clear();
+    g_canvas.clear(); g_root.clear();
+    g_leftHand.clear(); g_rightHand.clear();
+    g_font.clear();
+    g_built = false;
+    LOGI("menu shutdown");
 }
