@@ -5,6 +5,9 @@ from cryptography.hazmat.primitives.serialization import pkcs7
 from cryptography import x509
 from cryptography.x509.oid import NameOID
 
+# Package name — injected from env by patch_apk.yml, fallback hardcoded
+MODULE_PKG = os.environ.get("MODULE_PKG", "com.darkmatter.vrcmenu")
+
 def sign_apk(src, dst):
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     nm  = x509.Name([
@@ -48,69 +51,78 @@ def sign_apk(src, dst):
             zout.writestr("META-INF/CERT.SF", sf)
             zout.writestr("META-INF/CERT.RSA", p7)
 
-# ── Binary XML builder (no aapt2 needed) ────────────────────────────────────
-# Rip the binary AndroidManifest.xml directly from the VRChat APK
-# and patch the package name string in-place
-# This is the most reliable approach — Android binary XML is finicky to build from scratch
-
 def patch_binary_manifest(apk_path, new_package):
+    """
+    Patch com.vrchat.oculus.quest -> new_package in the binary AndroidManifest.xml.
+    Handles UTF-16-LE string pool encoding used in AXML.
+    """
     with zipfile.ZipFile(apk_path) as z:
         data = bytearray(z.read("AndroidManifest.xml"))
 
-    # Binary XML string pool: find "com.vrchat.oculus.quest" and replace with new package
-    old_pkg = "com.vrchat.oculus.quest".encode("utf-16-le")
-    new_pkg = new_package.encode("utf-16-le")
+    old_pkg    = "com.vrchat.oculus.quest"
+    old_bytes  = old_pkg.encode("utf-16-le")
+    new_bytes  = new_package.encode("utf-16-le")
+    old_len    = len(old_pkg)
+    new_len    = len(new_package)
 
-    idx = data.find(old_pkg)
+    idx = data.find(old_bytes)
     if idx == -1:
-        print("WARNING: package string not found in binary manifest")
+        print(f"WARNING: '{old_pkg}' not found in binary manifest — package not changed")
         return bytes(data)
 
-    # The string pool stores length as uint16 before the chars
-    # Patch length field (2 bytes before the string)
-    old_len = len("com.vrchat.oculus.quest")
-    new_len = len(new_package)
-
-    # Replace string in place — pad or truncate to same byte length
     if new_len <= old_len:
-        new_padded = new_pkg + b"\x00\x00" * (old_len - new_len)
-        data[idx:idx+len(old_pkg)] = new_padded
-        # Patch the length prefix
-        struct.pack_into("<H", data, idx-2, new_len)
-        struct.pack_into("<H", data, idx-4, new_len)  # some formats store it twice
+        # Pad with null chars to same UTF-16-LE byte length
+        padded = new_bytes + b"\x00\x00" * (old_len - new_len)
+        data[idx:idx + len(old_bytes)] = padded
+        # Patch length prefix fields (uint16, little-endian, appears 1-2x before the string)
+        struct.pack_into("<H", data, idx - 2, new_len)
+        if idx >= 4:
+            struct.pack_into("<H", data, idx - 4, new_len)
     else:
-        # Can't expand in-place safely — use the old package name won't work
-        # Instead patch length to new_len and overwrite, hoping no realloc needed
-        data[idx:idx+len(new_pkg)] = new_pkg
-        struct.pack_into("<H", data, idx-2, new_len)
+        # Longer replacement — overwrite and update length
+        data[idx:idx + len(new_bytes)] = new_bytes
+        struct.pack_into("<H", data, idx - 2, new_len)
 
-    print(f"Patched package: {new_package}")
+    print(f"Patched manifest package: {old_pkg} -> {new_package}")
     return bytes(data)
 
-print("Building Darkmatter module APK...")
+print(f"Building Darkmatter module APK — package: {MODULE_PKG}")
 
-binary_manifest = patch_binary_manifest("VRChat.apk", "com.darkmatter.vrc")
+binary_manifest = patch_binary_manifest("VRChat.apk", MODULE_PKG)
 
+# Locate libdarkmatter.so from ndk-build output or fallback
 so_path = None
 for root, dirs, files in os.walk("."):
     for fn in files:
         if fn == "libdarkmatter.so":
             so_path = os.path.join(root, fn)
             break
+    if so_path:
+        break
 if not so_path:
     so_path = "unpacked/lib/arm64-v8a/libvrc_fast_crypto.so"
-    print("Using patched libvrc_fast_crypto.so as payload")
+    print("Fallback: using patched libvrc_fast_crypto.so as payload")
+
+print(f"Payload .so: {so_path}  ({os.path.getsize(so_path)//1024}KB)")
 
 with zipfile.ZipFile("darkmatter-module-unsigned.apk", "w", zipfile.ZIP_DEFLATED) as z:
     info_mf = zipfile.ZipInfo("AndroidManifest.xml")
     info_mf.compress_type = zipfile.ZIP_STORED
     z.writestr(info_mf, binary_manifest)
-    z.writestr("assets/xposed_init", b"com.darkmatter.vrc.XposedInit\n")
+    xposed_cls = MODULE_PKG + ".XposedInit"
+    z.writestr("assets/xposed_init", (xposed_cls + "\n").encode())
     info_so = zipfile.ZipInfo("lib/arm64-v8a/libdarkmatter.so")
     info_so.compress_type = zipfile.ZIP_STORED
-    with open(so_path,"rb") as f:
+    with open(so_path, "rb") as f:
         z.writestr(info_so, f.read())
+    # Include Frida gadget if present
+    if os.path.exists("frida-gadget.so"):
+        info_fg = zipfile.ZipInfo("lib/arm64-v8a/libgadget.so")
+        info_fg.compress_type = zipfile.ZIP_STORED
+        with open("frida-gadget.so", "rb") as f:
+            z.writestr(info_fg, f.read())
+        print("[+] Frida gadget injected into module APK")
 
 sign_apk("darkmatter-module-unsigned.apk", "darkmatter-module.apk")
 size = os.path.getsize("darkmatter-module.apk")
-print(f"darkmatter-module.apk: {size//1024}KB")
+print(f"darkmatter-module.apk: {size//1024}KB  package={MODULE_PKG}")
