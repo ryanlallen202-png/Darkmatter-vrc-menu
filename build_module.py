@@ -5,7 +5,7 @@ from cryptography.hazmat.primitives.serialization import pkcs7
 from cryptography import x509
 from cryptography.x509.oid import NameOID
 
-MODULE_PKG = os.environ.get("MODULE_PKG", "com.darkmatter.vrcmenu")
+MODULE_PKG = os.environ.get("MODULE_PKG", "com.darkmatter.module")
 
 # wrap.sh — the entire no-root mechanism.
 # Android executes this before the app process when wrap.sh
