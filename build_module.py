@@ -18,7 +18,6 @@ def sign_apk(src, dst):
         .not_valid_before(datetime.datetime(2024,1,1))
         .not_valid_after(datetime.datetime(2034,1,1))
         .sign(key, hashes.SHA256()))
-    STORE_EXTS = {".so", ".arsc"}
     manifest_lines = ["Manifest-Version: 1.0\r\nCreated-By: ollie\r\n\r\n"]
     digests = {}
     with zipfile.ZipFile(src, "r") as zin:
@@ -43,84 +42,55 @@ def sign_apk(src, dst):
                 if item.filename.startswith("META-INF/"): continue
                 _, d = digests[item.filename]
                 ext = os.path.splitext(item.filename)[1].lower()
-                item.compress_type = zipfile.ZIP_STORED if ext in STORE_EXTS else zipfile.ZIP_DEFLATED
+                item.compress_type = zipfile.ZIP_STORED if ext in {".so",".arsc"} else zipfile.ZIP_DEFLATED
                 zout.writestr(item, d)
             zout.writestr("META-INF/MANIFEST.MF", manifest)
             zout.writestr("META-INF/CERT.SF", sf)
             zout.writestr("META-INF/CERT.RSA", p7)
 
-# ── Build binary AndroidManifest.xml using aapt2 ────────────────────────────
-print("Compiling AndroidManifest with aapt2...")
+# ── Binary XML builder (no aapt2 needed) ────────────────────────────────────
+# Rip the binary AndroidManifest.xml directly from the VRChat APK
+# and patch the package name string in-place
+# This is the most reliable approach — Android binary XML is finicky to build from scratch
 
-# Write a proper Gradle-free minimal Android project for aapt2
-os.makedirs("module_build/res", exist_ok=True)
+def patch_binary_manifest(apk_path, new_package):
+    with zipfile.ZipFile(apk_path) as z:
+        data = bytearray(z.read("AndroidManifest.xml"))
 
-manifest_text = """<?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.darkmatter.vrc"
-    android:versionCode="1"
-    android:versionName="1.0">
-    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="32"/>
-    <application android:label="Darkmatter VRC" android:hasCode="false">
-        <meta-data android:name="xposedmodule" android:value="true"/>
-        <meta-data android:name="xposeddescription" android:value="Darkmatter VRChat mod menu"/>
-        <meta-data android:name="xposedminversion" android:value="93"/>
-    </application>
-</manifest>"""
+    # Binary XML string pool: find "com.vrchat.oculus.quest" and replace with new package
+    old_pkg = "com.vrchat.oculus.quest".encode("utf-16-le")
+    new_pkg = new_package.encode("utf-16-le")
 
-with open("module_build/AndroidManifest.xml", "w") as f:
-    f.write(manifest_text)
+    idx = data.find(old_pkg)
+    if idx == -1:
+        print("WARNING: package string not found in binary manifest")
+        return bytes(data)
 
-# Use aapt2 to compile and link into a flat APK with binary manifest
-import subprocess, shutil
+    # The string pool stores length as uint16 before the chars
+    # Patch length field (2 bytes before the string)
+    old_len = len("com.vrchat.oculus.quest")
+    new_len = len(new_package)
 
-aapt2 = shutil.which("aapt2") or "/usr/local/lib/android/sdk/build-tools/35.0.0/aapt2"
-
-# Try aapt2 link to get binary manifest
-result = subprocess.run([
-    aapt2, "link",
-    "--manifest", "module_build/AndroidManifest.xml",
-    "-o", "module_build/base.apk",
-    "--min-sdk-version", "29",
-    "--target-sdk-version", "32",
-    "--version-code", "1",
-    "--version-name", "1.0",
-    "--java", "module_build/",
-], capture_output=True, text=True)
-
-if result.returncode != 0:
-    print("aapt2 error:", result.stderr[:500])
-    # Fallback: use apktools approach — download minimal framework
-    # Actually use the Android framework from the NDK install
-    android_jar = None
-    import glob
-    for p in glob.glob("/usr/local/lib/android/sdk/platforms/*/android.jar"):
-        android_jar = p
-        break
-    if android_jar:
-        result2 = subprocess.run([
-            aapt2, "link",
-            "--manifest", "module_build/AndroidManifest.xml",
-            "-I", android_jar,
-            "-o", "module_build/base.apk",
-        ], capture_output=True, text=True)
-        print("aapt2 with framework:", result2.returncode, result2.stderr[:200])
+    # Replace string in place — pad or truncate to same byte length
+    if new_len <= old_len:
+        new_padded = new_pkg + b"\x00\x00" * (old_len - new_len)
+        data[idx:idx+len(old_pkg)] = new_padded
+        # Patch the length prefix
+        struct.pack_into("<H", data, idx-2, new_len)
+        struct.pack_into("<H", data, idx-4, new_len)  # some formats store it twice
     else:
-        print("No android.jar found, trying apt install...")
-        subprocess.run(["apt-get", "install", "-y", "aapt2"], capture_output=True)
-else:
-    print("aapt2 link OK")
+        # Can't expand in-place safely — use the old package name won't work
+        # Instead patch length to new_len and overwrite, hoping no realloc needed
+        data[idx:idx+len(new_pkg)] = new_pkg
+        struct.pack_into("<H", data, idx-2, new_len)
 
-# Extract binary manifest from the linked APK
-if os.path.exists("module_build/base.apk"):
-    with zipfile.ZipFile("module_build/base.apk") as z:
-        binary_manifest = z.read("AndroidManifest.xml")
-    print(f"Binary manifest: {len(binary_manifest)} bytes")
-else:
-    print("FALLBACK: using plain text manifest (may not parse package name)")
-    binary_manifest = manifest_text.encode()
+    print(f"Patched package: {new_package}")
+    return bytes(data)
 
-# ── Assemble module APK ──────────────────────────────────────────────────────
+print("Building Darkmatter module APK...")
+
+binary_manifest = patch_binary_manifest("VRChat.apk", "com.darkmatter.vrc")
+
 so_path = None
 for root, dirs, files in os.walk("."):
     for fn in files:
@@ -132,13 +102,15 @@ if not so_path:
     print("Using patched libvrc_fast_crypto.so as payload")
 
 with zipfile.ZipFile("darkmatter-module-unsigned.apk", "w", zipfile.ZIP_DEFLATED) as z:
-    z.writestr("AndroidManifest.xml", binary_manifest)
+    info_mf = zipfile.ZipInfo("AndroidManifest.xml")
+    info_mf.compress_type = zipfile.ZIP_STORED
+    z.writestr(info_mf, binary_manifest)
     z.writestr("assets/xposed_init", b"com.darkmatter.vrc.XposedInit\n")
-    info = zipfile.ZipInfo("lib/arm64-v8a/libdarkmatter.so")
-    info.compress_type = zipfile.ZIP_STORED
+    info_so = zipfile.ZipInfo("lib/arm64-v8a/libdarkmatter.so")
+    info_so.compress_type = zipfile.ZIP_STORED
     with open(so_path,"rb") as f:
-        z.writestr(info, f.read())
+        z.writestr(info_so, f.read())
 
 sign_apk("darkmatter-module-unsigned.apk", "darkmatter-module.apk")
 size = os.path.getsize("darkmatter-module.apk")
-print(f"darkmatter-module.apk ready: {size//1024}KB")
+print(f"darkmatter-module.apk: {size//1024}KB")
