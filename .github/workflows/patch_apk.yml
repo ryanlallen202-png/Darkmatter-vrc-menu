@@ -7,6 +7,10 @@ jobs:
   patch:
     runs-on: ubuntu-24.04
 
+    env:
+      MODULE_PKG:  com.darkmatter.vrcmenu
+      SIGNED_PKG:  com.darkmatter.vrcmenu.signed
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,10 +39,25 @@ jobs:
       - name: Patch libvrc_fast_crypto.so
         run: python3 patch.py
 
-      - name: Sign VRChat APK
+      - name: Download latest Frida gadget (dynamic — no hardcoded URL)
+        run: |
+          FRIDA_VER=$(curl -s https://api.github.com/repos/frida/frida/releases/latest \
+            | python3 -c "import json,sys; print(json.load(sys.stdin)['tag_name'])")
+          echo "Frida: $FRIDA_VER"
+          GADGET_URL="https://github.com/frida/frida/releases/download/${FRIDA_VER}/frida-gadget-${FRIDA_VER}-android-arm64.so.gz"
+          curl -fL "$GADGET_URL" -o gadget.so.gz
+          gunzip gadget.so.gz
+          mv gadget.so frida-gadget.so
+          echo "[+] Frida gadget ready: $(du -sh frida-gadget.so)"
+
+      - name: Sign VRChat APK (package=${{ env.SIGNED_PKG }})
+        env:
+          SIGNED_PKG: ${{ env.SIGNED_PKG }}
         run: python3 sign.py
 
-      - name: Build Darkmatter module APK
+      - name: Build Darkmatter module APK (package=${{ env.MODULE_PKG }})
+        env:
+          MODULE_PKG: ${{ env.MODULE_PKG }}
         run: python3 build_module.py
 
       - name: Delete old release assets
