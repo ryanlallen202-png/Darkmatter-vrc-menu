@@ -14,13 +14,8 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends python3 python3-pip wget unzip aapt2
+          sudo apt-get install -y --no-install-recommends python3 python3-pip wget unzip
           pip install cryptography --break-system-packages -q
-
-      - name: Install Android SDK platform for aapt2
-        run: |
-          echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
-            "platforms;android-32" "build-tools;34.0.0" --sdk_root=$ANDROID_HOME 2>&1 | tail -5
 
       - name: Reassemble APK from parts
         run: |
@@ -34,7 +29,7 @@ jobs:
 
       - name: Extract libvrc_fast_crypto.so
         run: |
-          mkdir -p unpacked/lib/arm64-v8a module/assets
+          mkdir -p unpacked/lib/arm64-v8a
           unzip -q VRChat.apk lib/arm64-v8a/libvrc_fast_crypto.so -d unpacked/
 
       - name: Patch libvrc_fast_crypto.so
@@ -44,10 +39,34 @@ jobs:
         run: python3 sign.py
 
       - name: Build Darkmatter module APK
+        run: python3 build_module.py
+
+      - name: Delete old release assets
         run: |
-          export AAPT2=$ANDROID_HOME/build-tools/34.0.0/aapt2
-          export ANDROID_JAR=$ANDROID_HOME/platforms/android-32/android.jar
-          python3 build_module.py
+          python3 - << 'EOF'
+          import json, urllib.request, urllib.error
+          TOKEN = "${{ secrets.GITHUB_TOKEN }}"
+          OWNER = "ryanlallen202-png"
+          REPO  = "Darkmatter-vrc-menu"
+          req = urllib.request.Request(
+              f"https://api.github.com/repos/{OWNER}/{REPO}/releases/442843474/assets",
+              headers={"Authorization": f"token {TOKEN}", "Accept": "application/vnd.github+json"}
+          )
+          with urllib.request.urlopen(req) as r:
+              assets = json.loads(r.read())
+          for a in assets:
+              if a["name"] in ["darkmatter-module.apk", "DarkMatter-patched-signed.apk", "libvrc_fast_crypto_patched.so"]:
+                  del_req = urllib.request.Request(
+                      f"https://api.github.com/repos/{OWNER}/{REPO}/releases/assets/{a['id']}",
+                      headers={"Authorization": f"token {TOKEN}", "Accept": "application/vnd.github+json"},
+                      method="DELETE"
+                  )
+                  try:
+                      urllib.request.urlopen(del_req)
+                      print(f"Deleted: {a['name']}")
+                  except Exception as e:
+                      print(f"Delete err: {e}")
+          EOF
 
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
