@@ -1,4 +1,4 @@
-import zipfile, os, hashlib, base64, datetime
+import zipfile, os, hashlib, base64, datetime, struct
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.serialization import pkcs7
@@ -49,28 +49,96 @@ def sign_apk(src, dst):
             zout.writestr("META-INF/CERT.SF", sf)
             zout.writestr("META-INF/CERT.RSA", p7)
 
-print("Building Darkmatter module APK...")
+# ── Build binary AndroidManifest.xml using aapt2 ────────────────────────────
+print("Compiling AndroidManifest with aapt2...")
 
+# Write a proper Gradle-free minimal Android project for aapt2
+os.makedirs("module_build/res", exist_ok=True)
+
+manifest_text = """<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.darkmatter.vrc"
+    android:versionCode="1"
+    android:versionName="1.0">
+    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="32"/>
+    <application android:label="Darkmatter VRC" android:hasCode="false">
+        <meta-data android:name="xposedmodule" android:value="true"/>
+        <meta-data android:name="xposeddescription" android:value="Darkmatter VRChat mod menu"/>
+        <meta-data android:name="xposedminversion" android:value="93"/>
+    </application>
+</manifest>"""
+
+with open("module_build/AndroidManifest.xml", "w") as f:
+    f.write(manifest_text)
+
+# Use aapt2 to compile and link into a flat APK with binary manifest
+import subprocess, shutil
+
+aapt2 = shutil.which("aapt2") or "/usr/local/lib/android/sdk/build-tools/35.0.0/aapt2"
+
+# Try aapt2 link to get binary manifest
+result = subprocess.run([
+    aapt2, "link",
+    "--manifest", "module_build/AndroidManifest.xml",
+    "-o", "module_build/base.apk",
+    "--min-sdk-version", "29",
+    "--target-sdk-version", "32",
+    "--version-code", "1",
+    "--version-name", "1.0",
+    "--java", "module_build/",
+], capture_output=True, text=True)
+
+if result.returncode != 0:
+    print("aapt2 error:", result.stderr[:500])
+    # Fallback: use apktools approach — download minimal framework
+    # Actually use the Android framework from the NDK install
+    android_jar = None
+    import glob
+    for p in glob.glob("/usr/local/lib/android/sdk/platforms/*/android.jar"):
+        android_jar = p
+        break
+    if android_jar:
+        result2 = subprocess.run([
+            aapt2, "link",
+            "--manifest", "module_build/AndroidManifest.xml",
+            "-I", android_jar,
+            "-o", "module_build/base.apk",
+        ], capture_output=True, text=True)
+        print("aapt2 with framework:", result2.returncode, result2.stderr[:200])
+    else:
+        print("No android.jar found, trying apt install...")
+        subprocess.run(["apt-get", "install", "-y", "aapt2"], capture_output=True)
+else:
+    print("aapt2 link OK")
+
+# Extract binary manifest from the linked APK
+if os.path.exists("module_build/base.apk"):
+    with zipfile.ZipFile("module_build/base.apk") as z:
+        binary_manifest = z.read("AndroidManifest.xml")
+    print(f"Binary manifest: {len(binary_manifest)} bytes")
+else:
+    print("FALLBACK: using plain text manifest (may not parse package name)")
+    binary_manifest = manifest_text.encode()
+
+# ── Assemble module APK ──────────────────────────────────────────────────────
 so_path = None
 for root, dirs, files in os.walk("."):
     for fn in files:
         if fn == "libdarkmatter.so":
             so_path = os.path.join(root, fn)
             break
-
 if not so_path:
     so_path = "unpacked/lib/arm64-v8a/libvrc_fast_crypto.so"
-    print(f"Using patched libvrc_fast_crypto.so as payload lib")
+    print("Using patched libvrc_fast_crypto.so as payload")
 
 with zipfile.ZipFile("darkmatter-module-unsigned.apk", "w", zipfile.ZIP_DEFLATED) as z:
-    with open("module/AndroidManifest.xml","rb") as f:
-        z.writestr("AndroidManifest.xml", f.read())
-    with open("module/assets/xposed_init","rb") as f:
-        z.writestr("assets/xposed_init", f.read())
+    z.writestr("AndroidManifest.xml", binary_manifest)
+    z.writestr("assets/xposed_init", b"com.darkmatter.vrc.XposedInit\n")
     info = zipfile.ZipInfo("lib/arm64-v8a/libdarkmatter.so")
     info.compress_type = zipfile.ZIP_STORED
     with open(so_path,"rb") as f:
         z.writestr(info, f.read())
 
 sign_apk("darkmatter-module-unsigned.apk", "darkmatter-module.apk")
-print(f"Module APK ready: darkmatter-module.apk ({os.path.getsize('darkmatter-module.apk')//1024}KB)")
+size = os.path.getsize("darkmatter-module.apk")
+print(f"darkmatter-module.apk ready: {size//1024}KB")
