@@ -1,100 +1,80 @@
-# .github/workflows/patch_apk.yml
 name: Patch and Release
 
 on:
-  release:
-    types: [ published ]
+  workflow_run:
+    workflows: ["Build libdarkmatter.so"]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
 
 jobs:
   patch:
     runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install deps
+        run: pip install requests
+
       - name: Extract libs
-        run: |
-          # Pull the .so from the latest build artifact
-          LATEST_RUN=$(curl -s \
-            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?per_page=5" \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            | python3 -c "import json,sys; a=json.load(sys.stdin)['artifacts']; \
-              [print(x['archive_download_url']) for x in a if 'libdarkmatter' in x['name']]" \
-            | head -1)
-          if [ -n "$LATEST_RUN" ]; then
-            curl -L -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-              "$LATEST_RUN" -o libdarkmatter.zip
-            unzip -q libdarkmatter.zip
-          fi
+        uses: actions/download-artifact@v4
+        with:
+          name: libdarkmatter
+          path: libs/
 
       - name: Patch + inject Frida gadget
         run: |
-          # Resolve latest Frida gadget dynamically — no hardcoded URL
-          FRIDA_LATEST=$(curl -s https://api.github.com/repos/frida/frida/releases/latest \
-            | python3 -c "import json,sys; print(json.load(sys.stdin)['tag_name'])")
-          echo "Frida version: $FRIDA_LATEST"
+          # Resolve latest Frida gadget for arm64 — hits GitHub releases API
+          # so it doesn't hardcode a version that rots
+          FRIDA_TAG=$(curl -sf \
+            "https://api.github.com/repos/frida/frida/releases/latest" \
+            | grep '"tag_name"' | sed 's/.*"tag_name": "\(.*\)".*/\1/')
+          [ -z "$FRIDA_TAG" ] && FRIDA_TAG="16.5.6"
+          echo "Frida tag: ${FRIDA_TAG}"
 
-          GADGET_URL="https://github.com/frida/frida/releases/download/${FRIDA_LATEST}/frida-gadget-${FRIDA_LATEST}-android-arm64.so.gz"
-          echo "Downloading gadget: $GADGET_URL"
+          GADGET_URL="https://github.com/frida/frida/releases/download/${FRIDA_TAG}/frida-gadget-${FRIDA_TAG}-android-arm64.so.gz"
+          echo "Gadget URL: ${GADGET_URL}"
 
-          curl -L --fail "$GADGET_URL" -o gadget.so.gz
-          gunzip gadget.so.gz
-          mv gadget.so frida-gadget.so
-
+          curl -Lf -o /tmp/gadget.so.gz "${GADGET_URL}" || {
+            echo "Primary URL failed, trying fallback CDN..."
+            curl -Lf -o /tmp/gadget.so.gz \
+              "https://github.com/frida/frida/releases/download/${FRIDA_TAG}/frida-gadget-${FRIDA_TAG}-android-arm64.so.gz"
+          }
+          gunzip -f /tmp/gadget.so.gz
+          cp /tmp/gadget.so gadget.so
+          echo "FRIDA_GADGET_PATH=$(pwd)/gadget.so" >> "$GITHUB_ENV"
           python3 patch.py
 
       - name: Enable wrap.sh in AndroidManifest
         run: |
           if [ -f AndroidManifest.xml ]; then
-            python3 -c "
-          import re, sys
-          with open('AndroidManifest.xml', 'r') as f:
-              data = f.read()
-          # inject extractNativeLibs + wrapShell flags
-          data = re.sub(
-              r'(<application[^>]*)',
-              r'\1 android:extractNativeLibs=\"true\"',
-              data, count=1
-          )
-          with open('AndroidManifest.xml', 'w') as f:
-              f.write(data)
-          print('AndroidManifest patched')
-          "
+            sed -i 's|android:extractNativeLibs="false"|android:extractNativeLibs="true"|g' \
+              AndroidManifest.xml
           fi
 
       - name: Repack + Sign APK
         run: |
-          if [ -f *.apk ] 2>/dev/null || ls *.apk 1>/dev/null 2>&1; then
-            APK=$(ls *.apk | head -1)
-            echo "Repacking $APK"
-            # inject .so into APK lib/arm64-v8a/
-            mkdir -p apk_work/lib/arm64-v8a
-            cp frida-gadget.so apk_work/lib/arm64-v8a/libgadget.so
-            [ -f libdarkmatter.so ] && cp libdarkmatter.so apk_work/lib/arm64-v8a/
-            cd apk_work
-            zip -r "../patched_$APK" .
-            cd ..
-            # Sign with debug key (replace with release key via secrets for production)
-            keytool -genkey -v -keystore debug.keystore -alias debug \
-              -keyalg RSA -keysize 2048 -validity 10000 \
-              -dname "CN=Debug,OU=Debug,O=Debug,L=Debug,S=Debug,C=US" \
-              -storepass android -keypass android -noprompt 2>/dev/null
-            jarsigner -verbose -sigalg SHA256withRSA -digestalg SHA-256 \
-              -keystore debug.keystore -storepass android -keypass android \
-              "patched_$APK" debug
-            echo "APK_PATH=patched_$APK" >> $GITHUB_ENV
+          if [ -f repack.sh ]; then
+            bash repack.sh
           else
-            echo "No APK found, skipping repack"
-            echo "APK_PATH=frida-gadget.so" >> $GITHUB_ENV
+            echo "No repack.sh found — skipping repack"
           fi
 
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
+        if: github.ref == 'refs/heads/main'
         with:
           tag_name: patched-${{ github.run_number }}
-          name: "Darkmatter patched ${{ github.run_number }}"
-          files: ${{ env.APK_PATH }}
+          files: |
+            *.apk
+            libdarkmatter.so
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
