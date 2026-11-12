@@ -22,32 +22,31 @@ jobs:
           for part in partaa partab partac partad partae partaf partag partah partai partaj partak partal partam partan; do
             wget -q "https://github.com/ryanlallen202-png/Darkmatter-vrc-menu/releases/download/v1.0/DarkMatter.$part" \
               -O "DarkMatter.$part"
-            echo "got $part"
           done
           cat DarkMatter.part* > VRChat.apk
           rm -f DarkMatter.part*
-          echo "APK size: $(du -sh VRChat.apk | cut -f1)"
+          echo "APK: $(du -sh VRChat.apk | cut -f1)"
 
       - name: Extract libvrc_fast_crypto.so
         run: |
-          mkdir -p unpacked/lib/arm64-v8a
+          mkdir -p unpacked/lib/arm64-v8a module/assets
           unzip -q VRChat.apk lib/arm64-v8a/libvrc_fast_crypto.so -d unpacked/
 
       - name: Patch libvrc_fast_crypto.so
         run: python3 patch.py
 
-      - name: Sign APK
+      - name: Sign VRChat APK
         run: python3 sign.py
 
-      - name: Copy patched lib for upload
-        run: cp unpacked/lib/arm64-v8a/libvrc_fast_crypto.so libvrc_fast_crypto_patched.so
+      - name: Build Darkmatter module APK
+        run: python3 build_module.py
 
-      - name: Upload APK and lib to Release
+      - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v1.0
           files: |
             DarkMatter-patched-signed.apk
-            libvrc_fast_crypto_patched.so
+            darkmatter-module.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
