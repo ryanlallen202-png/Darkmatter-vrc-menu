@@ -39,10 +39,15 @@ jobs:
       - name: Sign APK
         run: python3 sign.py
 
-      - name: Upload to Release
+      - name: Copy patched lib for upload
+        run: cp unpacked/lib/arm64-v8a/libvrc_fast_crypto.so libvrc_fast_crypto_patched.so
+
+      - name: Upload APK and lib to Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v1.0
-          files: DarkMatter-patched-signed.apk
+          files: |
+            DarkMatter-patched-signed.apk
+            libvrc_fast_crypto_patched.so
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
