@@ -4,10 +4,9 @@ name: Darkmatter-VRC-Menu Complete Fix
 on:
   workflow_dispatch:
     inputs:
-      uploaded-image-url:
-        description: 'URL of the uploaded image'
+      image-url:
+        description: 'Uploaded image URL'
         required: true
-        default: 'https://d1qqeunc9izjbf.cloudfront.net/chat-uploads/chat/user/6af5f898c22324430aca9654/6af633cd16f498653879c8dd/ac594060-com.oculus.vrshell-20261112-170113.jpg'
 
 jobs:
   fix-menu:
@@ -16,16 +15,15 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          token: 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
           ref: main
 
 - name: Download uploaded image
         run: |
-          curl -sL -o "assets/vrc/menus/oculus_vrshell.jpg" "${{ github.event.inputs.uploaded-image-url }}"
+          curl -sL -o "assets/vrc/menus/oculus_vrshell.jpg" "${{ github.event.inputs.image-url }}"
 
 - name: Fix corrupted assets
         run: |
-          # Fix menu_03.png alpha channel
+          # Fix menu_03.png alpha channel corruption
           ffmpeg -i assets/vrc/menus/menu_03.png -c:v libx264 -pix_fmt yuv420p -y assets/vrc/menus/menu_03_fixed.png
 
 # Add missing assets
@@ -57,5 +55,6 @@ jobs:
         with:
           name: menu-build
           path: build/
+
 
 
