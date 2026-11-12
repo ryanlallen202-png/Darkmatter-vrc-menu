@@ -1,8 +1,9 @@
-# .github/workflows/build.yml
 name: Build libdarkmatter.so
 
 on:
   push:
+    branches: [ main ]
+  pull_request:
     branches: [ main ]
   workflow_dispatch:
 
@@ -22,13 +23,13 @@ jobs:
 
       - name: Install NDK r26c
         run: |
-          ANDROID_SDK_ROOT="${HOME}/android-sdk"
-          mkdir -p "$ANDROID_SDK_ROOT/ndk"
-          NDK_URL="https://dl.google.com/android/repository/android-ndk-r26c-linux.zip"
-          curl -L "$NDK_URL" -o ndk.zip
-          unzip -q ndk.zip -d "$ANDROID_SDK_ROOT/ndk"
-          echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/android-ndk-r26c" >> $GITHUB_ENV
-          echo "NDK_ROOT=$ANDROID_SDK_ROOT/ndk/android-ndk-r26c" >> $GITHUB_ENV
+          NDKV="r27c"
+          NDK_ZIP="android-ndk-${NDKV}-linux.zip"
+          curl -L -o "${NDK_ZIP}" \
+            "https://dl.google.com/android/repository/${NDK_ZIP}"
+          unzip -q "${NDK_ZIP}"
+          echo "NDK_HOME=$(pwd)/android-ndk-${NDKV}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$(pwd)/android-ndk-${NDKV}" >> "$GITHUB_ENV"
 
       - name: Swap main
         run: |
@@ -38,68 +39,89 @@ jobs:
 
       - name: Get ShadowHook
         run: |
-          # Resolve latest ShadowHook release dynamically — no hardcoded tag
-          SHADOWHOOK_LATEST=$(curl -s https://api.github.com/repos/bytedance/android-inline-hook/releases/latest \
-            | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
-          echo "ShadowHook tag: $SHADOWHOOK_LATEST"
+          # ByteDance ShadowHook — fetch latest release tag then pull the AAR
+          SHADOWHOOK_TAG=$(curl -sf \
+            "https://api.github.com/repos/bytedance/android-inline-hook/releases/latest" \
+            | grep '"tag_name"' | sed 's/.*"tag_name": "\(.*\)".*/\1/')
+          [ -z "$SHADOWHOOK_TAG" ] && SHADOWHOOK_TAG="v1.1.1"
+          echo "ShadowHook tag: ${SHADOWHOOK_TAG}"
 
-          DOWNLOAD_URL="https://github.com/bytedance/android-inline-hook/releases/download/${SHADOWHOOK_LATEST}/shadowhook-android-${SHADOWHOOK_LATEST}.zip"
-          echo "Downloading: $DOWNLOAD_URL"
+          mkdir -p libs/shadowhook/jni/arm64-v8a
+          mkdir -p libs/shadowhook/include
 
-          mkdir -p libs/shadowhook
-          curl -L --fail "$DOWNLOAD_URL" -o shadowhook.zip
-          unzip -q shadowhook.zip -d libs/shadowhook
-          echo "ShadowHook extracted:"
-          find libs/shadowhook -type f | head -30
+          # Download the AAR
+          AAR_URL="https://github.com/bytedance/android-inline-hook/releases/download/${SHADOWHOOK_TAG}/shadowhook-android-release.aar"
+          curl -Lf -o /tmp/shadowhook.aar "${AAR_URL}" || {
+            # Fallback: Maven Central
+            curl -Lf -o /tmp/shadowhook.aar \
+              "https://repo1.maven.org/maven2/com/bytedance/android/shadowhook/${SHADOWHOOK_TAG#v}/shadowhook-${SHADOWHOOK_TAG#v}.aar"
+          }
+
+          # Extract .so and headers from AAR (it's a zip)
+          cd /tmp && unzip -q shadowhook.aar -d shadowhook_aar || true
+          find /tmp/shadowhook_aar -name "*.so" -path "*arm64-v8a*" \
+            -exec cp {} "$GITHUB_WORKSPACE/libs/shadowhook/jni/arm64-v8a/" \;
+          find /tmp/shadowhook_aar -name "*.h" \
+            -exec cp {} "$GITHUB_WORKSPACE/libs/shadowhook/include/" \;
+
+          # Verify we got something
+          ls -la "$GITHUB_WORKSPACE/libs/shadowhook/jni/arm64-v8a/"
+          ls -la "$GITHUB_WORKSPACE/libs/shadowhook/include/"
 
       - name: Get FFmpegKit
         run: |
-          FFKIT_LATEST=$(curl -s https://api.github.com/repos/arthenica/ffmpeg-kit/releases/latest \
-            | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
-          echo "FFmpegKit tag: $FFKIT_LATEST"
-          mkdir -p libs/ffmpegkit
-          curl -L --fail \
-            "https://github.com/arthenica/ffmpeg-kit/releases/download/${FFKIT_LATEST}/ffmpeg-kit-min-${FFKIT_LATEST}-android-arm64-v8a.zip" \
-            -o ffmpegkit.zip || echo "WARN: FFmpegKit download failed, continuing"
-          [ -f ffmpegkit.zip ] && unzip -q ffmpegkit.zip -d libs/ffmpegkit || true
+          FFMPEG_TAG="6.0-2"
+          mkdir -p libs/ffmpeg/jni/arm64-v8a
+          mkdir -p libs/ffmpeg/include
+          curl -Lf -o /tmp/ffmpegkit.aar \
+            "https://github.com/arthenica/ffmpeg-kit/releases/download/v${FFMPEG_TAG}/ffmpeg-kit-min-arm64-v8a-${FFMPEG_TAG}.aar" || \
+          curl -Lf -o /tmp/ffmpegkit.aar \
+            "https://repo1.maven.org/maven2/com/arthenica/ffmpeg-kit-min/${FFMPEG_TAG}/ffmpeg-kit-min-${FFMPEG_TAG}.aar"
+          cd /tmp && unzip -q ffmpegkit.aar -d ffmpegkit_aar || true
+          find /tmp/ffmpegkit_aar -name "*.so" -path "*arm64-v8a*" \
+            -exec cp {} "$GITHUB_WORKSPACE/libs/ffmpeg/jni/arm64-v8a/" \;
+          find /tmp/ffmpegkit_aar -name "*.h" \
+            -exec cp {} "$GITHUB_WORKSPACE/libs/ffmpeg/include/" \;
 
       - name: CMake Configure
         run: |
-          mkdir -p build
-          cmake -B build \
-            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_ROOT/build/cmake/android.toolchain.cmake" \
+          cmake \
+            -S Darkmatter-vrc-menu \
+            -B build \
+            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-26 \
-            -DANDROID_NDK="$ANDROID_NDK_ROOT" \
+            -DANDROID_NDK="${ANDROID_NDK_HOME}" \
             -DCMAKE_BUILD_TYPE=Release \
-            -DSHADOWHOOK_ROOT="${{ github.workspace }}/libs/shadowhook" \
-            -S .
+            -DSHADOWHOOK_INCLUDE_DIR="${GITHUB_WORKSPACE}/libs/shadowhook/include" \
+            -DSHADOWHOOK_LIB_DIR="${GITHUB_WORKSPACE}/libs/shadowhook/jni/arm64-v8a"
 
       - name: CMake Build
         run: cmake --build build --config Release -j$(nproc)
 
       - name: Locate .so
-        id: locate
         run: |
-          SO_PATH=$(find build -name "*.so" | head -1)
-          echo "so_path=$SO_PATH" >> $GITHUB_OUTPUT
-          echo "Found: $SO_PATH"
+          SO_PATH=$(find build -name "libdarkmatter.so" | head -1)
+          echo "LIBSO_PATH=${SO_PATH}" >> "$GITHUB_ENV"
+          echo "Found: ${SO_PATH}"
 
       - name: Upload libdarkmatter.so
         uses: actions/upload-artifact@v4
         with:
-          name: libdarkmatter-arm64-v8a
-          path: ${{ steps.locate.outputs.so_path }}
+          name: libdarkmatter
+          path: ${{ env.LIBSO_PATH }}
 
       - name: Create Release
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
-          name: "Darkmatter build ${{ github.run_number }}"
-          files: ${{ steps.locate.outputs.so_path }}
+          files: ${{ env.LIBSO_PATH }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Summary
-        run: echo "✅ libdarkmatter.so built and uploaded — build ${{ github.run_number }}"
+        run: |
+          echo "## Build Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Artifact: libdarkmatter.so" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Run: ${{ github.run_number }}" >> "$GITHUB_STEP_SUMMARY"
