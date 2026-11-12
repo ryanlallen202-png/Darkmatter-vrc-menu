@@ -2,6 +2,11 @@ name: Patch and Release VRChat APK
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag (e.g. v2.0)"
+        required: false
+        default: ""
 
 jobs:
   patch:
@@ -29,7 +34,7 @@ jobs:
           done
           cat DarkMatter.part* > VRChat.apk
           rm -f DarkMatter.part*
-          echo "APK: $(du -sh VRChat.apk | cut -f1)"
+          echo "APK size: $(du -sh VRChat.apk | cut -f1)"
 
       - name: Extract libvrc_fast_crypto.so
         run: |
@@ -39,7 +44,7 @@ jobs:
       - name: Patch libvrc_fast_crypto.so
         run: python3 patch.py
 
-      - name: Download latest Frida gadget (dynamic — no hardcoded URL)
+      - name: Download latest Frida gadget
         run: |
           FRIDA_VER=$(curl -s https://api.github.com/repos/frida/frida/releases/latest \
             | python3 -c "import json,sys; print(json.load(sys.stdin)['tag_name'])")
@@ -48,7 +53,25 @@ jobs:
           curl -fL "$GADGET_URL" -o gadget.so.gz
           gunzip gadget.so.gz
           mv gadget.so frida-gadget.so
-          echo "[+] Frida gadget ready: $(du -sh frida-gadget.so)"
+          echo "Gadget: $(du -sh frida-gadget.so | cut -f1)"
+
+      - name: Download latest libdarkmatter.so from build artifact
+        run: |
+          ART_URL=$(curl -s \
+            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?per_page=5" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            | python3 -c "
+          import json,sys
+          arts=[a for a in json.load(sys.stdin)['artifacts'] if 'darkmatter-release' in a['name'] and not a['expired']]
+          print(arts[0]['archive_download_url']) if arts else print('')
+          ")
+          if [ -n "$ART_URL" ]; then
+            curl -fL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" "$ART_URL" -o dm.zip
+            unzip -q dm.zip
+            echo "libdarkmatter.so: $(du -sh libdarkmatter.so | cut -f1)"
+          else
+            echo "No artifact found — will use patched crypto .so as fallback"
+          fi
 
       - name: Sign VRChat APK (package=${{ env.SIGNED_PKG }})
         env:
@@ -60,7 +83,17 @@ jobs:
           MODULE_PKG: ${{ env.MODULE_PKG }}
         run: python3 build_module.py
 
-      - name: Delete old release assets
+      - name: Compute release tag
+        id: tag
+        run: |
+          INPUT="${{ github.event.inputs.release_tag }}"
+          if [ -n "$INPUT" ]; then
+            echo "tag=$INPUT" >> $GITHUB_OUTPUT
+          else
+            echo "tag=patched-$(date +%Y%m%d)-${{ github.run_number }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Delete stale assets from v1.0 release
         run: |
           python3 - << 'EOF'
           import json, urllib.request, urllib.error
@@ -73,8 +106,9 @@ jobs:
           )
           with urllib.request.urlopen(req) as r:
               assets = json.loads(r.read())
+          stale = ["darkmatter-module.apk","DarkMatter-patched-signed.apk","libvrc_fast_crypto_patched.so"]
           for a in assets:
-              if a["name"] in ["darkmatter-module.apk", "DarkMatter-patched-signed.apk", "libvrc_fast_crypto_patched.so"]:
+              if a["name"] in stale:
                   del_req = urllib.request.Request(
                       f"https://api.github.com/repos/{OWNER}/{REPO}/releases/assets/{a['id']}",
                       headers={"Authorization": f"token {TOKEN}", "Accept": "application/vnd.github+json"},
@@ -84,13 +118,30 @@ jobs:
                       urllib.request.urlopen(del_req)
                       print(f"Deleted: {a['name']}")
                   except Exception as e:
-                      print(f"Delete err: {e}")
+                      print(f"Skip: {e}")
           EOF
 
-      - name: Upload to Release
+      - name: Create new release with both APKs
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "Darkmatter ${{ steps.tag.outputs.tag }} — patched VRChat + module"
+          prerelease: ${{ !startsWith(steps.tag.outputs.tag, 'v') }}
+          body: |
+            ## Darkmatter ${{ steps.tag.outputs.tag }}
+
+            ### Files
+            | File | Description |
+            |------|-------------|
+            | `darkmatter-module.apk` | LSPosed/Zygisk module — package `com.darkmatter.vrcmenu` |
+            | `DarkMatter-patched-signed.apk` | Patched VRChat APK — package `com.darkmatter.vrcmenu.signed` |
+
+            ### Install
+            1. Flash `darkmatter-module.apk` via LSPosed or Zygisk
+            2. Sideload `DarkMatter-patched-signed.apk` — replaces stock VRChat
+            3. Enable module in LSPosed → scope VRChat → reboot
+
+            Built from `${{ github.sha }}`
           files: |
             DarkMatter-patched-signed.apk
             darkmatter-module.apk
