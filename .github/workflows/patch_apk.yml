@@ -46,19 +46,53 @@ jobs:
 
       - name: Download latest Frida gadget
         run: |
+          # Get latest tag
           FRIDA_VER=$(curl -s https://api.github.com/repos/frida/frida/releases/latest \
             | python3 -c "import json,sys; print(json.load(sys.stdin)['tag_name'])")
-          echo "Frida: $FRIDA_VER"
-          GADGET_URL="https://github.com/frida/frida/releases/download/${FRIDA_VER}/frida-gadget-${FRIDA_VER}-android-arm64.so.gz"
-          curl -fL "$GADGET_URL" -o gadget.so.gz
-          gunzip gadget.so.gz
-          mv gadget.so frida-gadget.so
-          echo "Gadget: $(du -sh frida-gadget.so | cut -f1)"
+          echo "Frida version: $FRIDA_VER"
+
+          # List all assets for that release and find the arm64 gadget
+          ASSET_URL=$(curl -s "https://api.github.com/repos/frida/frida/releases/tags/${FRIDA_VER}" \
+            | python3 -c "
+          import json,sys
+          assets = json.load(sys.stdin).get('assets', [])
+          for a in assets:
+              n = a['name']
+              # match both old .so.gz and new .zip naming
+              if 'gadget' in n and 'android' in n and 'arm64' in n and ('arm64-v8a' not in n) and ('x86' not in n):
+                  print(a['browser_download_url'])
+                  break
+          ")
+
+          if [ -z "$ASSET_URL" ]; then
+            echo "ERROR: could not find arm64 gadget asset for $FRIDA_VER"
+            echo "Available assets:"
+            curl -s "https://api.github.com/repos/frida/frida/releases/tags/${FRIDA_VER}" \
+              | python3 -c "import json,sys; [print(a['name']) for a in json.load(sys.stdin).get('assets',[])]"
+            exit 1
+          fi
+
+          echo "Downloading: $ASSET_URL"
+          curl -fL "$ASSET_URL" -o gadget_raw
+
+          # Handle both .gz and .zip
+          if echo "$ASSET_URL" | grep -q ".so.gz"; then
+            gunzip gadget_raw
+            mv gadget_raw_decompressed frida-gadget.so 2>/dev/null || mv gadget_raw frida-gadget.so
+          elif echo "$ASSET_URL" | grep -q ".zip"; then
+            unzip -q gadget_raw -d gadget_dir
+            find gadget_dir -name "*.so" | head -1 | xargs -I{} cp {} frida-gadget.so
+          else
+            # bare .so
+            cp gadget_raw frida-gadget.so
+          fi
+
+          echo "Gadget ready: $(du -sh frida-gadget.so | cut -f1)"
 
       - name: Download latest libdarkmatter.so from build artifact
         run: |
           ART_URL=$(curl -s \
-            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?per_page=5" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts?per_page=10" \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             | python3 -c "
           import json,sys
@@ -70,7 +104,7 @@ jobs:
             unzip -q dm.zip
             echo "libdarkmatter.so: $(du -sh libdarkmatter.so | cut -f1)"
           else
-            echo "No artifact found — will use patched crypto .so as fallback"
+            echo "No fresh artifact — using patched crypto .so as fallback"
           fi
 
       - name: Sign VRChat APK (package=${{ env.SIGNED_PKG }})
@@ -133,13 +167,13 @@ jobs:
             ### Files
             | File | Description |
             |------|-------------|
-            | `darkmatter-module.apk` | LSPosed/Zygisk module — package `com.darkmatter.vrcmenu` |
-            | `DarkMatter-patched-signed.apk` | Patched VRChat APK — package `com.darkmatter.vrcmenu.signed` |
+            | `darkmatter-module.apk` | No-root module — package `com.darkmatter.vrcmenu` |
+            | `DarkMatter-patched-signed.apk` | Patched VRChat — package `com.darkmatter.vrcmenu.signed` |
 
-            ### Install
-            1. Flash `darkmatter-module.apk` via LSPosed or Zygisk
-            2. Sideload `DarkMatter-patched-signed.apk` — replaces stock VRChat
-            3. Enable module in LSPosed → scope VRChat → reboot
+            ### Install (no root needed)
+            1. Download `DarkMatter-patched-signed.apk` in Quest browser
+            2. Uninstall stock VRChat first: Settings → Apps → VRChat → Uninstall
+            3. Tap the downloaded APK → Install
 
             Built from `${{ github.sha }}`
           files: |
