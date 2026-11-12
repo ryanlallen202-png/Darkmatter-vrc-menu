@@ -1,0 +1,46 @@
+# .github/workflows/menu-fix.yml
+name: Darkmatter-VRC-Menu Image Fix
+
+on:
+  workflow_dispatch:
+
+jobs:
+  fix-menu:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: main
+
+- name: Fix corrupted menu_03.png
+        run: |
+          ffmpeg -i assets/vrc/menus/menu_03.png -c:v libx264 -pix_fmt yuv420p -y assets/vrc/menus/menu_03_fixed.png
+
+- name: Add missing assets
+        run: |
+          mkdir -p assets/{icons,fonts}
+          wget -O assets/icons/icon_64x64.png "https://raw.githubusercontent.com/ryanlallen202-png/Darkmatter-vrc-menu/v2.0/assets/icons/icon_64x64.png"
+          wget -O assets/fonts/Roboto-Regular.ttf "https://fonts.google.com/specimen/Roboto/Download"
+
+- name: Merge v2.0 assets
+        run: |
+          git fetch origin v2.0
+          git checkout v2.0
+          git pull origin v2.0
+          git checkout main
+          git merge --no-ff v2.0
+
+- name: Build menu
+        run: |
+          rm -rf build
+          mkdir build && cd build
+          cmake -B . -DCMAKE_BUILD_TYPE=Release
+          cmake --build . --target all --config Release
+
+- name: Upload build
+        uses: actions/upload-artifact@v3
+        with:
+          name: menu-build
+          path: build/
