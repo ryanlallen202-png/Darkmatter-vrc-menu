@@ -13,8 +13,8 @@ jobs:
     runs-on: ubuntu-24.04
 
     env:
-      MODULE_PKG:  com.darkmatter.vrcmenu
-      SIGNED_PKG:  com.darkmatter.vrcmenu.signed
+      MODULE_PKG:  com.darkmatter.module
+      SIGNED_PKG:  com.darkmatter.vrchat
 
     steps:
       - name: Checkout
