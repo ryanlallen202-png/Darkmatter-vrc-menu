@@ -1,0 +1,41 @@
+name: Patch and Release VRChat APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends python3 python3-pip wget unzip
+          pip install cryptography --break-system-packages -q
+
+      - name: Download VRChat APK from release
+        run: |
+          wget -q --show-progress \
+            "https://github.com/ryanlallen202-png/Darkmatter-vrc-menu/releases/download/v1.0/VRChat_2026_4_2-1948-2b94e366a5-Release.apk" \
+            -O VRChat.apk
+          echo "APK: $(du -sh VRChat.apk | cut -f1)"
+
+      - name: Patch libvrc_fast_crypto.so
+        run: |
+          mkdir -p unpacked
+          unzip -q VRChat.apk lib/arm64-v8a/libvrc_fast_crypto.so -d unpacked/
+          python3 patch.py
+
+      - name: Repack + Sign APK
+        run: python3 sign.py
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0
+          files: DarkMatter-patched-signed.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
