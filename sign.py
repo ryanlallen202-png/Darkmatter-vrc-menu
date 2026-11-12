@@ -5,7 +5,7 @@ from cryptography.hazmat.primitives.serialization import pkcs7
 from cryptography import x509
 from cryptography.x509.oid import NameOID
 
-SIGNED_PKG = os.environ.get("SIGNED_PKG", "com.darkmatter.vrcmenu.signed")
+SIGNED_PKG = os.environ.get("SIGNED_PKG", "com.darkmatter.vrchat")
 
 WRAP_SH = b"#!/system/bin/sh\n" \
           b"HERE=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\n" \
