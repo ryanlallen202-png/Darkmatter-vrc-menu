@@ -1,80 +1,48 @@
-name: Patch and Release
+name: Patch and Release VRChat APK
 
 on:
-  workflow_run:
-    workflows: ["Build libdarkmatter.so"]
-    types: [completed]
-    branches: [main]
   workflow_dispatch:
 
 jobs:
   patch:
-    runs-on: ubuntu-latest
-    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install deps
-        run: pip install requests
-
-      - name: Extract libs
-        uses: actions/download-artifact@v4
-        with:
-          name: libdarkmatter
-          path: libs/
-
-      - name: Patch + inject Frida gadget
+      - name: Install tools
         run: |
-          # Resolve latest Frida gadget for arm64 — hits GitHub releases API
-          # so it doesn't hardcode a version that rots
-          FRIDA_TAG=$(curl -sf \
-            "https://api.github.com/repos/frida/frida/releases/latest" \
-            | grep '"tag_name"' | sed 's/.*"tag_name": "\(.*\)".*/\1/')
-          [ -z "$FRIDA_TAG" ] && FRIDA_TAG="16.5.6"
-          echo "Frida tag: ${FRIDA_TAG}"
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends python3 python3-pip wget unzip
+          pip install cryptography --break-system-packages -q
 
-          GADGET_URL="https://github.com/frida/frida/releases/download/${FRIDA_TAG}/frida-gadget-${FRIDA_TAG}-android-arm64.so.gz"
-          echo "Gadget URL: ${GADGET_URL}"
-
-          curl -Lf -o /tmp/gadget.so.gz "${GADGET_URL}" || {
-            echo "Primary URL failed, trying fallback CDN..."
-            curl -Lf -o /tmp/gadget.so.gz \
-              "https://github.com/frida/frida/releases/download/${FRIDA_TAG}/frida-gadget-${FRIDA_TAG}-android-arm64.so.gz"
-          }
-          gunzip -f /tmp/gadget.so.gz
-          cp /tmp/gadget.so gadget.so
-          echo "FRIDA_GADGET_PATH=$(pwd)/gadget.so" >> "$GITHUB_ENV"
-          python3 patch.py
-
-      - name: Enable wrap.sh in AndroidManifest
+      - name: Reassemble APK from parts
         run: |
-          if [ -f AndroidManifest.xml ]; then
-            sed -i 's|android:extractNativeLibs="false"|android:extractNativeLibs="true"|g' \
-              AndroidManifest.xml
-          fi
+          for part in partaa partab partac partad partae partaf partag partah partai partaj partak partal partam partan; do
+            wget -q "https://github.com/ryanlallen202-png/Darkmatter-vrc-menu/releases/download/v1.0/DarkMatter.$part" \
+              -O "DarkMatter.$part"
+            echo "got $part"
+          done
+          cat DarkMatter.part* > VRChat.apk
+          rm -f DarkMatter.part*
+          echo "APK size: $(du -sh VRChat.apk | cut -f1)"
 
-      - name: Repack + Sign APK
+      - name: Extract libvrc_fast_crypto.so
         run: |
-          if [ -f repack.sh ]; then
-            bash repack.sh
-          else
-            echo "No repack.sh found — skipping repack"
-          fi
+          mkdir -p unpacked/lib/arm64-v8a
+          unzip -q VRChat.apk lib/arm64-v8a/libvrc_fast_crypto.so -d unpacked/
+
+      - name: Patch libvrc_fast_crypto.so
+        run: python3 patch.py
+
+      - name: Sign APK
+        run: python3 sign.py
 
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
-        if: github.ref == 'refs/heads/main'
         with:
-          tag_name: patched-${{ github.run_number }}
-          files: |
-            *.apk
-            libdarkmatter.so
+          tag_name: v1.0
+          files: DarkMatter-patched-signed.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
