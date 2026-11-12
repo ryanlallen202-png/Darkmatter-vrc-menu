@@ -12,24 +12,15 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # ------------------------------------------------------------------ #
-      # 1. Checkout
-      # ------------------------------------------------------------------ #
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # ------------------------------------------------------------------ #
-      # 2. Set up JDK
-      # ------------------------------------------------------------------ #
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
 
-      # ------------------------------------------------------------------ #
-      # 3. Install Android NDK r25c
-      # ------------------------------------------------------------------ #
       - name: Install Android NDK r25c
         run: |
           set -euo pipefail
@@ -41,9 +32,6 @@ jobs:
           echo "ANDROID_NDK_ROOT=$HOME/android-ndk-r25c" >> "$GITHUB_ENV"
           echo "$HOME/android-ndk-r25c" >> "$GITHUB_PATH"
 
-      # ------------------------------------------------------------------ #
-      # 4. Write Android.mk + Application.mk (inline — no commit needed)
-      # ------------------------------------------------------------------ #
       - name: Write makefiles
         run: |
           cat > Android.mk << 'MAKEOF'
@@ -65,12 +53,8 @@ jobs:
           APP_STL      := c++_static
           APP_OPTIM    := release
           MAKEOF
-
           echo "[+] Makefiles written"
 
-      # ------------------------------------------------------------------ #
-      # 5. Verify source files exist
-      # ------------------------------------------------------------------ #
       - name: Verify source tree
         run: |
           for f in shared.hpp main.cpp features.cpp menu.cpp esp.cpp soundboard.cpp; do
@@ -78,9 +62,6 @@ jobs:
           done
           echo "[+] Source tree OK"
 
-      # ------------------------------------------------------------------ #
-      # 6. ndk-build
-      # ------------------------------------------------------------------ #
       - name: ndk-build
         run: |
           set -euo pipefail
@@ -93,10 +74,7 @@ jobs:
             APP_OPTIM=release \
             -j$(nproc)
 
-      # ------------------------------------------------------------------ #
-      # 7. Verify output + JNI symbols
-      # ------------------------------------------------------------------ #
-      - name: Verify .so
+      - name: Verify .so + JNI symbols
         run: |
           SO="libs/arm64-v8a/libdarkmatter.so"
           [ -f "$SO" ] || { echo "[-] Build failed — $SO not found"; exit 1; }
@@ -107,18 +85,12 @@ jobs:
             || { echo "[-] JNI symbols missing"; exit 1; }
           echo "[+] JNI symbols present"
 
-      # ------------------------------------------------------------------ #
-      # 8. Strip debug info
-      # ------------------------------------------------------------------ #
       - name: Strip .so
         run: |
           STRIP="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
           "$STRIP" --strip-unneeded libs/arm64-v8a/libdarkmatter.so
           echo "[+] Stripped: $(du -sh libs/arm64-v8a/libdarkmatter.so)"
 
-      # ------------------------------------------------------------------ #
-      # 9. Upload artifact
-      # ------------------------------------------------------------------ #
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -126,9 +98,6 @@ jobs:
           path: libs/arm64-v8a/libdarkmatter.so
           retention-days: 30
 
-      # ------------------------------------------------------------------ #
-      # 10. Create release on tag push (v*.*.*)
-      # ------------------------------------------------------------------ #
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
