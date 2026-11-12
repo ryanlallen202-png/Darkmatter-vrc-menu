@@ -1,0 +1,59 @@
+# .github/workflows/full-menu-fix.yml
+name: Darkmatter-VRC-Menu Complete Fix
+
+on:
+  workflow_dispatch:
+    inputs:
+      uploaded-image-url:
+        description: 'URL of the uploaded image'
+        required: true
+        default: 'https://d1qqeunc9izjbf.cloudfront.net/chat-uploads/chat/user/6af5f898c22324430aca9654/6af633cd16f498653879c8dd/67d4e8cf-com.oculus.vrshell-20261112-165547.jpg'
+
+jobs:
+  fix-menu:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: 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
+          ref: main
+
+- name: Download uploaded image
+        run: |
+          curl -sL -o "assets/vrc/menus/oculus_vrshell.jpg" "${{ github.event.inputs.uploaded-image-url }}"
+
+- name: Fix corrupted assets
+        run: |
+          # Fix menu_03.png alpha channel
+          ffmpeg -i assets/vrc/menus/menu_03.png -c:v libx264 -pix_fmt yuv420p -y assets/vrc/menus/menu_03_fixed.png
+
+# Add missing assets
+          mkdir -p assets/{icons,fonts}
+          wget -O assets/icons/icon_64x64.png "https://raw.githubusercontent.com/ryanlallen202-png/Darkmatter-vrc-menu/v2.0/assets/icons/icon_64x64.png"
+          wget -O assets/fonts/Roboto-Regular.ttf "https://fonts.google.com/specimen/Roboto/Download"
+
+- name: Download v2.0 assets
+        run: |
+          wget -P assets/vrc/menus/ "https://raw.githubusercontent.com/ryanlallen202-png/Darkmatter-vrc-menu/v2.0/assets/vrc/menus/vrc_menu_128x128.png"
+
+- name: Merge v2.0 assets
+        run: |
+          git fetch origin v2.0
+          git checkout v2.0
+          git pull origin v2.0
+          git checkout main
+          git merge --no-ff v2.0
+
+- name: Build menu overlay
+        run: |
+          rm -rf build
+          mkdir build && cd build
+          cmake -B . -DCMAKE_BUILD_TYPE=Release
+          cmake --build . --target all --config Release
+
+- name: Upload build
+        uses: actions/upload-artifact@v3
+        with:
+          name: menu-build
+          path: build/
