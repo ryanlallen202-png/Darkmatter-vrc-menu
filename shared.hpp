@@ -1,4 +1,3 @@
-// shared.hpp — C++17, Android arm64-v8a, IL2CPP thin runtime layer
 #pragma once
 #include <android/log.h>
 #include <dlfcn.h>
@@ -40,7 +39,7 @@ inline Color ColorRainbow(float t){
     return{cl(r),cl(g),cl(b),1};
 }
 
-// ---- IL2CPP thin layer ----------------------------------------------------
+// ---- IL2CPP thin layer -----------------------------------------------------
 struct Il2CppObject; struct Il2CppClass; struct Il2CppType;
 struct MethodInfo;   struct Il2CppString; struct Il2CppArray;
 
@@ -58,48 +57,71 @@ typedef void*         (*fn_gchandle_target)(void*);
 typedef void          (*fn_gchandle_free)(void*);
 typedef Il2CppArray*  (*fn_array_new)(Il2CppClass*,uintptr_t);
 typedef void*         (*fn_value_box)(Il2CppClass*,void*);
-// System.Type from class (needed for AddComponent)
 typedef void*         (*fn_class_get_type)(Il2CppClass*);
 
 struct IL2CPPApi {
-    fn_object_new       object_new  = nullptr;
-    fn_class_from_name  class_from  = nullptr;
-    fn_domain_get       domain_get  = nullptr;
-    fn_domain_assemblies assemblies = nullptr;
-    fn_assembly_image   img         = nullptr;
-    fn_method_from_name method      = nullptr;
-    fn_runtime_invoke   invoke      = nullptr;
-    fn_string_new       str_new     = nullptr;
-    fn_object_class     obj_class   = nullptr;
-    fn_gchandle_new     gc_new      = nullptr;
-    fn_gchandle_target  gc_target   = nullptr;
-    fn_gchandle_free    gc_free     = nullptr;
-    fn_array_new        arr_new     = nullptr;
-    fn_value_box        val_box     = nullptr;
-    fn_class_get_type   class_type  = nullptr;   // il2cpp_class_get_type
+    fn_object_new        object_new  = nullptr;
+    fn_class_from_name   class_from  = nullptr;
+    fn_domain_get        domain_get  = nullptr;
+    fn_domain_assemblies assemblies  = nullptr;
+    fn_assembly_image    img         = nullptr;
+    fn_method_from_name  method      = nullptr;
+    fn_runtime_invoke    invoke      = nullptr;
+    fn_string_new        str_new     = nullptr;
+    fn_object_class      obj_class   = nullptr;
+    fn_gchandle_new      gc_new      = nullptr;
+    fn_gchandle_target   gc_target   = nullptr;
+    fn_gchandle_free     gc_free     = nullptr;
+    fn_array_new         arr_new     = nullptr;
+    fn_value_box         val_box     = nullptr;
+    fn_class_get_type    class_type  = nullptr;
     bool ready = false;
 
-    bool         Init();
-    void*        GetImage(const char* assembly);
-    Il2CppClass* GetClass(const char* ns, const char* name,
-                          const char* assembly="Assembly-CSharp");
-    MethodInfo*  GetMethod(Il2CppClass* cls, const char* name, int argc=-1);
-    Il2CppObject*Invoke(MethodInfo* m, void* obj, void** args=nullptr);
+    bool          Init();
+    void*         GetImage(const char* assembly);
+    Il2CppClass*  GetClass(const char* ns, const char* name,
+                           const char* assembly="Assembly-CSharp");
+    MethodInfo*   GetMethod(Il2CppClass* cls, const char* name, int argc=-1);
+    Il2CppObject* Invoke(MethodInfo* m, void* obj, void** args=nullptr);
     template<typename T>
     T Unbox(Il2CppObject* o){ return o?*(T*)((uint8_t*)o+sizeof(void*)*2):T{}; }
-    std::string  StrGet(Il2CppString* s);
-    Il2CppString*StrNew(const char* s){ return str_new?str_new(s):nullptr; }
-    // Returns a System.Type* (Il2CppReflectionType) for AddComponent(Type)
-    void*        TypeOf(Il2CppClass* cls){
-        return (cls && class_type) ? (void*)class_type(cls) : nullptr;
+    std::string   StrGet(Il2CppString* s);
+    Il2CppString* StrNew(const char* s){ return str_new?str_new(s):nullptr; }
+    void*         TypeOf(Il2CppClass* cls){
+        return (cls&&class_type)?(void*)class_type(cls):nullptr;
     }
 };
 
 extern IL2CPPApi IL2;
 
 // ---- Ref (rooted GC handle) ------------------------------------------------
+// clear() declared first so set() can call it without forward-ref error
 struct Ref {
-    void *h=nullptr;
-    void set(Il2CppObject*o){clear();if(o&&IL2.gc_new)h=IL2.gc_new(o,false);}
-    Il2CppObject* get()const{
-        return
+    void *h = nullptr;
+
+    void clear() {
+        if (h && IL2.gc_free) IL2.gc_free(h);
+        h = nullptr;
+    }
+    void set(Il2CppObject* o) {
+        clear();
+        if (o && IL2.gc_new) h = IL2.gc_new(o, false);
+    }
+    Il2CppObject* get() const {
+        return (h && IL2.gc_target)
+            ? (Il2CppObject*)IL2.gc_target(h)
+            : nullptr;
+    }
+    bool alive() const;
+};
+
+// ---- Patch helpers ---------------------------------------------------------
+bool      Patch(uintptr_t addr, const uint8_t* bytes, size_t len);
+void      NopRange(uintptr_t addr, int count);
+void      RetPatch(uintptr_t addr);
+void      RetTrue(uintptr_t addr);
+uintptr_t GetLibBase(const char* libname);
+
+// ---- Global time -----------------------------------------------------------
+extern double g_time;
+extern float  g_dt;
