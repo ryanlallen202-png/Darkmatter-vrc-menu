@@ -1,11 +1,11 @@
-# .github/workflows/menu-fix.yml
-name: Darkmatter-VRC-Menu Image Fix
+# .github/workflows/vrc-menu-fix.yml
+name: VRC Menu Image Fix
 
 on:
   workflow_dispatch:
 
 jobs:
-  fix-menu:
+  fix-menu-assets:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
@@ -18,7 +18,7 @@ jobs:
         run: |
           ffmpeg -i assets/vrc/menus/menu_03.png -c:v libx264 -pix_fmt yuv420p -y assets/vrc/menus/menu_03_fixed.png
 
-- name: Add missing assets
+- name: Download missing assets
         run: |
           mkdir -p assets/{icons,fonts}
           wget -O assets/icons/icon_64x64.png "https://raw.githubusercontent.com/ryanlallen202-png/Darkmatter-vrc-menu/v2.0/assets/icons/icon_64x64.png"
@@ -32,7 +32,7 @@ jobs:
           git checkout main
           git merge --no-ff v2.0
 
-- name: Build menu
+- name: Build menu overlay
         run: |
           rm -rf build
           mkdir build && cd build
@@ -44,3 +44,4 @@ jobs:
         with:
           name: menu-build
           path: build/
+
