@@ -6,12 +6,12 @@ from cryptography import x509
 from cryptography.x509.oid import NameOID
 
 key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-name = x509.Name([
+nm  = x509.Name([
     x509.NameAttribute(NameOID.COMMON_NAME, "DarkMatter"),
     x509.NameAttribute(NameOID.ORGANIZATION_NAME, "olivia"),
 ])
 cert = (x509.CertificateBuilder()
-    .subject_name(name).issuer_name(name)
+    .subject_name(nm).issuer_name(nm)
     .public_key(key.public_key())
     .serial_number(x509.random_serial_number())
     .not_valid_before(datetime.datetime(2024,1,1))
@@ -21,8 +21,7 @@ cert = (x509.CertificateBuilder()
 src = "VRChat.apk"
 dst = "DarkMatter-patched-signed.apk"
 
-# Files that MUST be stored uncompressed + 4-byte aligned (Android R+ requirement)
-MUST_STORE = {".so", ".arsc"}
+STORE_EXTS = {".so", ".arsc", ".png", ".jpg", ".flat"}
 
 manifest_lines = ["Manifest-Version: 1.0\r\nCreated-By: ollie\r\n\r\n"]
 digests = {}
@@ -39,14 +38,16 @@ with zipfile.ZipFile(src, "r") as zin:
         digests[item.filename] = (sha, d)
 
 manifest = "".join(manifest_lines).encode()
+
 sf_lines = ["Signature-Version: 1.0\r\nCreated-By: ollie\r\nSHA-256-Digest-Manifest: "
             + base64.b64encode(hashlib.sha256(manifest).digest()).decode() + "\r\n\r\n"]
-for n, (s, _) in digests.items():
+for n,(s,_) in digests.items():
     sf_lines.append(f"Name: {n}\r\nSHA-256-Digest: {s}\r\n\r\n")
 sf = "".join(sf_lines).encode()
 
 p7 = (pkcs7.PKCS7SignatureBuilder()
-      .set_data(sf).add_signer(cert, key, hashes.SHA256())
+      .set_data(sf)
+      .add_signer(cert, key, hashes.SHA256())
       .sign(serialization.Encoding.DER, [pkcs7.PKCS7Options.DetachedSignature]))
 
 with zipfile.ZipFile(src, "r") as zin:
@@ -55,7 +56,7 @@ with zipfile.ZipFile(src, "r") as zin:
             if item.filename.startswith("META-INF/"): continue
             _, d = digests[item.filename]
             ext = os.path.splitext(item.filename)[1].lower()
-            if ext in MUST_STORE or item.filename == "resources.arsc":
+            if ext in STORE_EXTS or item.filename == "resources.arsc":
                 item.compress_type = zipfile.ZIP_STORED
             else:
                 item.compress_type = zipfile.ZIP_DEFLATED
@@ -64,4 +65,4 @@ with zipfile.ZipFile(src, "r") as zin:
         zout.writestr("META-INF/CERT.SF", sf)
         zout.writestr("META-INF/CERT.RSA", p7)
 
-print(f"Signed: {dst} ({os.path.getsize(dst)//1024//1024}MB)")
+print(f"Signed APK: {dst} ({os.path.getsize(dst)//1024//1024}MB)")
