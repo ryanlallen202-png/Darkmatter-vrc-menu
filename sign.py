@@ -21,8 +21,12 @@ cert = (x509.CertificateBuilder()
 src = "VRChat.apk"
 dst = "DarkMatter-patched-signed.apk"
 
+# Files that MUST be stored uncompressed + 4-byte aligned (Android R+ requirement)
+MUST_STORE = {".so", ".arsc"}
+
 manifest_lines = ["Manifest-Version: 1.0\r\nCreated-By: ollie\r\n\r\n"]
 digests = {}
+
 with zipfile.ZipFile(src, "r") as zin:
     for item in zin.infolist():
         if item.filename.startswith("META-INF/"): continue
@@ -46,12 +50,15 @@ p7 = (pkcs7.PKCS7SignatureBuilder()
       .sign(serialization.Encoding.DER, [pkcs7.PKCS7Options.DetachedSignature]))
 
 with zipfile.ZipFile(src, "r") as zin:
-    with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zout:
+    with zipfile.ZipFile(dst, "w", allowZip64=True) as zout:
         for item in zin.infolist():
             if item.filename.startswith("META-INF/"): continue
             _, d = digests[item.filename]
-            if item.filename.endswith(".so"):
+            ext = os.path.splitext(item.filename)[1].lower()
+            if ext in MUST_STORE or item.filename == "resources.arsc":
                 item.compress_type = zipfile.ZIP_STORED
+            else:
+                item.compress_type = zipfile.ZIP_DEFLATED
             zout.writestr(item, d)
         zout.writestr("META-INF/MANIFEST.MF", manifest)
         zout.writestr("META-INF/CERT.SF", sf)
