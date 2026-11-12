@@ -7,7 +7,7 @@ on:
       uploaded-image-url:
         description: 'URL of the uploaded image'
         required: true
-        default: 'https://d1qqeunc9izjbf.cloudfront.net/chat-uploads/chat/user/6af5f898c22324430aca9654/6af633cd16f498653879c8dd/67d4e8cf-com.oculus.vrshell-20261112-165547.jpg'
+        default: 'https://d1qqeunc9izjbf.cloudfront.net/chat-uploads/chat/user/6af5f898c22324430aca9654/6af633cd16f498653879c8dd/ac594060-com.oculus.vrshell-20261112-170113.jpg'
 
 jobs:
   fix-menu:
@@ -50,10 +50,11 @@ jobs:
           rm -rf build
           mkdir build && cd build
           cmake -B . -DCMAKE_BUILD_TYPE=Release
-          cmake --build . --target all --config Release
+          cmake --build . --target menu_overlay --config Release
 
 - name: Upload build
         uses: actions/upload-artifact@v3
         with:
           name: menu-build
           path: build/
+
