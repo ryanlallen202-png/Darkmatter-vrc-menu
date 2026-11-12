@@ -1,10 +1,15 @@
-name: Build libdarkmatter.so
+# .github/workflows/build.yml
+# Triggers on every push to main and on pull requests.
+# Builds libdarkmatter.so (arm64-v8a, android-29) via NDK r25c.
+# Artifact: darkmatter-release containing the .so ready to push to device.
+
+name: Build Darkmatter
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -12,116 +17,102 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      # ------------------------------------------------------------------ #
+      # 1. Checkout
+      # ------------------------------------------------------------------ #
+      - name: Checkout repo
         uses: actions/checkout@v4
 
+      # ------------------------------------------------------------------ #
+      # 2. Set up JDK (NDK toolchain needs it)
+      # ------------------------------------------------------------------ #
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          java-version: '17'
-          distribution: 'temurin'
+          distribution: temurin
+          java-version: 17
 
-      - name: Install NDK r26c
+      # ------------------------------------------------------------------ #
+      # 3. Install Android NDK r25c
+      # ------------------------------------------------------------------ #
+      - name: Install Android NDK r25c
         run: |
-          NDKV="r27c"
-          NDK_ZIP="android-ndk-${NDKV}-linux.zip"
-          curl -L -o "${NDK_ZIP}" \
-            "https://dl.google.com/android/repository/${NDK_ZIP}"
-          unzip -q "${NDK_ZIP}"
-          echo "NDK_HOME=$(pwd)/android-ndk-${NDKV}" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_HOME=$(pwd)/android-ndk-${NDKV}" >> "$GITHUB_ENV"
+          set -euo pipefail
+          NDK_ZIP="android-ndk-r25c-linux.zip"
+          NDK_URL="https://dl.google.com/android/repository/$NDK_ZIP"
+          echo "[*] Downloading NDK r25c"
+          curl -fsSL -o "$NDK_ZIP" "$NDK_URL"
+          unzip -q "$NDK_ZIP" -d "$HOME"
+          echo "ANDROID_NDK_ROOT=$HOME/android-ndk-r25c" >> "$GITHUB_ENV"
+          echo "$HOME/android-ndk-r25c" >> "$GITHUB_PATH"
 
-      - name: Swap main
+      # ------------------------------------------------------------------ #
+      # 4. Verify source files exist
+      # ------------------------------------------------------------------ #
+      - name: Verify source tree
         run: |
-          if [ -f main.cpp ]; then
-            cp main.cpp Darkmatter-vrc-menu/main.cpp 2>/dev/null || true
-          fi
+          for f in shared.hpp main.cpp features.cpp menu.cpp esp.cpp soundboard.cpp Android.mk Application.mk; do
+            [ -f "$f" ] || { echo "[-] Missing: $f"; exit 1; }
+          done
+          echo "[+] Source tree OK"
 
-      - name: Get ShadowHook
+      # ------------------------------------------------------------------ #
+      # 5. ndk-build
+      # ------------------------------------------------------------------ #
+      - name: ndk-build
         run: |
-          # ByteDance ShadowHook — fetch latest release tag then pull the AAR
-          SHADOWHOOK_TAG=$(curl -sf \
-            "https://api.github.com/repos/bytedance/android-inline-hook/releases/latest" \
-            | grep '"tag_name"' | sed 's/.*"tag_name": "\(.*\)".*/\1/')
-          [ -z "$SHADOWHOOK_TAG" ] && SHADOWHOOK_TAG="v1.1.1"
-          echo "ShadowHook tag: ${SHADOWHOOK_TAG}"
+          set -euo pipefail
+          "$ANDROID_NDK_ROOT/ndk-build" \
+            NDK_PROJECT_PATH=. \
+            APP_BUILD_SCRIPT=Android.mk \
+            APP_ABI=arm64-v8a \
+            APP_PLATFORM=android-29 \
+            APP_STL=c++_static \
+            APP_OPTIM=release \
+            -j$(nproc)
 
-          mkdir -p libs/shadowhook/jni/arm64-v8a
-          mkdir -p libs/shadowhook/include
-
-          # Download the AAR
-          AAR_URL="https://github.com/bytedance/android-inline-hook/releases/download/${SHADOWHOOK_TAG}/shadowhook-android-release.aar"
-          curl -Lf -o /tmp/shadowhook.aar "${AAR_URL}" || {
-            # Fallback: Maven Central
-            curl -Lf -o /tmp/shadowhook.aar \
-              "https://repo1.maven.org/maven2/com/bytedance/android/shadowhook/${SHADOWHOOK_TAG#v}/shadowhook-${SHADOWHOOK_TAG#v}.aar"
-          }
-
-          # Extract .so and headers from AAR (it's a zip)
-          cd /tmp && unzip -q shadowhook.aar -d shadowhook_aar || true
-          find /tmp/shadowhook_aar -name "*.so" -path "*arm64-v8a*" \
-            -exec cp {} "$GITHUB_WORKSPACE/libs/shadowhook/jni/arm64-v8a/" \;
-          find /tmp/shadowhook_aar -name "*.h" \
-            -exec cp {} "$GITHUB_WORKSPACE/libs/shadowhook/include/" \;
-
-          # Verify we got something
-          ls -la "$GITHUB_WORKSPACE/libs/shadowhook/jni/arm64-v8a/"
-          ls -la "$GITHUB_WORKSPACE/libs/shadowhook/include/"
-
-      - name: Get FFmpegKit
+      # ------------------------------------------------------------------ #
+      # 6. Verify output
+      # ------------------------------------------------------------------ #
+      - name: Verify .so
         run: |
-          FFMPEG_TAG="6.0-2"
-          mkdir -p libs/ffmpeg/jni/arm64-v8a
-          mkdir -p libs/ffmpeg/include
-          curl -Lf -o /tmp/ffmpegkit.aar \
-            "https://github.com/arthenica/ffmpeg-kit/releases/download/v${FFMPEG_TAG}/ffmpeg-kit-min-arm64-v8a-${FFMPEG_TAG}.aar" || \
-          curl -Lf -o /tmp/ffmpegkit.aar \
-            "https://repo1.maven.org/maven2/com/arthenica/ffmpeg-kit-min/${FFMPEG_TAG}/ffmpeg-kit-min-${FFMPEG_TAG}.aar"
-          cd /tmp && unzip -q ffmpegkit.aar -d ffmpegkit_aar || true
-          find /tmp/ffmpegkit_aar -name "*.so" -path "*arm64-v8a*" \
-            -exec cp {} "$GITHUB_WORKSPACE/libs/ffmpeg/jni/arm64-v8a/" \;
-          find /tmp/ffmpegkit_aar -name "*.h" \
-            -exec cp {} "$GITHUB_WORKSPACE/libs/ffmpeg/include/" \;
+          SO="libs/arm64-v8a/libdarkmatter.so"
+          [ -f "$SO" ] || { echo "[-] Build failed — $SO not found"; exit 1; }
+          echo "[+] Built: $(du -sh $SO)"
+          file "$SO"
+          # Confirm arm64 and no missing JNI symbols
+          "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" \
+            -D "$SO" | grep -E "JNI_OnLoad|JNI_OnUnload" \
+            || { echo "[-] JNI symbols missing"; exit 1; }
+          echo "[+] JNI symbols present"
 
-      - name: CMake Configure
+      # ------------------------------------------------------------------ #
+      # 7. Strip debug info for release
+      # ------------------------------------------------------------------ #
+      - name: Strip .so
         run: |
-          cmake \
-            -S Darkmatter-vrc-menu \
-            -B build \
-            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake" \
-            -DANDROID_ABI=arm64-v8a \
-            -DANDROID_PLATFORM=android-26 \
-            -DANDROID_NDK="${ANDROID_NDK_HOME}" \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DSHADOWHOOK_INCLUDE_DIR="${GITHUB_WORKSPACE}/libs/shadowhook/include" \
-            -DSHADOWHOOK_LIB_DIR="${GITHUB_WORKSPACE}/libs/shadowhook/jni/arm64-v8a"
+          STRIP="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          "$STRIP" --strip-unneeded libs/arm64-v8a/libdarkmatter.so
+          echo "[+] Stripped: $(du -sh libs/arm64-v8a/libdarkmatter.so)"
 
-      - name: CMake Build
-        run: cmake --build build --config Release -j$(nproc)
-
-      - name: Locate .so
-        run: |
-          SO_PATH=$(find build -name "libdarkmatter.so" | head -1)
-          echo "LIBSO_PATH=${SO_PATH}" >> "$GITHUB_ENV"
-          echo "Found: ${SO_PATH}"
-
-      - name: Upload libdarkmatter.so
+      # ------------------------------------------------------------------ #
+      # 8. Upload artifact
+      # ------------------------------------------------------------------ #
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: libdarkmatter
-          path: ${{ env.LIBSO_PATH }}
+          name: darkmatter-release
+          path: libs/arm64-v8a/libdarkmatter.so
+          retention-days: 30
 
-      - name: Create Release
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+      # ------------------------------------------------------------------ #
+      # 9. Create release on tag push (v*.*.*)
+      # ------------------------------------------------------------------ #
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: build-${{ github.run_number }}
-          files: ${{ env.LIBSO_PATH }}
+          files: libs/arm64-v8a/libdarkmatter.so
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Summary
-        run: |
-          echo "## Build Summary" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Artifact: libdarkmatter.so" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Run: ${{ github.run_number }}" >> "$GITHUB_STEP_SUMMARY"
