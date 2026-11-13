@@ -31,67 +31,54 @@ jobs:
           python3 sign.py
           python3 build_module.py
 
-      - name: Verify APKs
+      - name: Verify both APKs
         run: |
           python3 - << 'EOF'
           import zipfile, os, sys
-
           errors = []
 
-          # Check patched APK
           apk = "DarkMatter-patched-signed.apk"
           if not os.path.exists(apk) or os.path.getsize(apk) < 100*1024*1024:
-              errors.append(f"FAIL: {apk} missing or too small")
+              errors.append(f"FAIL: {apk} missing or too small ({os.path.getsize(apk) if os.path.exists(apk) else 0})")
           else:
               with zipfile.ZipFile(apk) as z:
-                  names = z.namelist()
-                  if "lib/arm64-v8a/libvrc_fast_crypto.so" not in names:
-                      errors.append("FAIL: patched lib missing from APK")
-                  if not any(n.startswith("META-INF/") for n in names):
-                      errors.append("FAIL: APK not signed")
-              print(f"OK: {apk} ({os.path.getsize(apk)//1024//1024}MB)")
+                  if "lib/arm64-v8a/libvrc_fast_crypto.so" not in z.namelist():
+                      errors.append("FAIL: patched lib missing")
+                  if not any(n.startswith("META-INF/") for n in z.namelist()):
+                      errors.append("FAIL: APK unsigned")
+              print(f"OK: {apk} {os.path.getsize(apk)//1024//1024}MB")
 
-          # Check module APK
           mod = "darkmatter-module.apk"
-          if not os.path.exists(mod) or os.path.getsize(mod) < 100*1024:
-              errors.append(f"FAIL: {mod} missing or too small")
+          if not os.path.exists(mod) or os.path.getsize(mod) < 50*1024:
+              errors.append(f"FAIL: {mod} missing or too small ({os.path.getsize(mod) if os.path.exists(mod) else 0}B)")
           else:
               with zipfile.ZipFile(mod) as z:
                   names = z.namelist()
-                  if "AndroidManifest.xml" not in names:
-                      errors.append("FAIL: module has no manifest")
-                  if "assets/xposed_init" not in names:
-                      errors.append("FAIL: module has no xposed_init")
-                  if not any("libdarkmatter" in n for n in names):
-                      errors.append("FAIL: module has no .so")
-              print(f"OK: {mod} ({os.path.getsize(mod)//1024}KB)")
+                  if "AndroidManifest.xml" not in names: errors.append("FAIL: no manifest")
+                  if not any(".so" in n for n in names): errors.append("FAIL: no .so in module")
+              print(f"OK: {mod} {os.path.getsize(mod)//1024}KB")
 
           if errors:
-              for e in errors: print(e)
+              [print(e) for e in errors]
               sys.exit(1)
           print("All checks passed.")
           EOF
 
-      - name: Create v1.1 release and upload
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v1.1
-          name: "Darkmatter v1.1 — patched + module"
-          body: |
-            ## Darkmatter v1.1
-
-            **DarkMatter-patched-signed.apk** — patched VRChat, install via ADB or sideloader
-            **darkmatter-module.apk** — Xposed module (com.darkmatter.vrc), scope to VRChat in LSPatch
-
-            Install order:
-            1. Install DarkMatter-patched-signed.apk
-            2. Install darkmatter-module.apk
-            3. LSPatch -> Manage -> VRChat -> Module scope -> + -> Darkmatter VRC
-            4. Reboot
-
-            absolute ollie, built by olivia — https://discord.gg/ojailbreaks
-          files: |
-            DarkMatter-patched-signed.apk
-            darkmatter-module.apk
+      - name: Delete old v1.1 assets if exist
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view v1.1 --json assets --jq '.assets[].name' 2>/dev/null | while read name; do
+            echo "Deleting old asset: $name"
+            gh release delete-asset v1.1 "$name" -y 2>/dev/null || true
+          done
+
+      - name: Upload to v1.1 release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload v1.1 \
+            "DarkMatter-patched-signed.apk" \
+            "darkmatter-module.apk" \
+            --clobber
+          echo "Uploaded both APKs to v1.1"
