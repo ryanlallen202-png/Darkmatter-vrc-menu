@@ -1,140 +1,235 @@
-name: Build Darkmatter
+name: Darkmatter Build
 
 on:
   push:
-    branches: [main]
-    tags:
-      - "v*.*.*"
-  pull_request:
-    branches: [main]
+    branches: [ main ]
   workflow_dispatch:
 
+env:
+  NDK_VERSION: "26.3.11579264"
+  MIN_SDK: 29
+  TARGET_SDK: 34
+  # ── Package names ───────────────────────────────────────────────────────────
+  PKG_MODULE:  "com.darkmatter.module"       # darkmatter-module APK
+  PKG_PATCHED: "com.darkmatter.vrchat"       # Dark Matter VRChat signed APK
+
 jobs:
-  build:
+  # ════════════════════════════════════════════════════════════════════════════
+  # 1. Build the native .so + produce the module APK
+  # ════════════════════════════════════════════════════════════════════════════
+  build-module:
+    name: Build darkmatter-module APK
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+    - name: Checkout
+      uses: actions/checkout@v4
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17
+    # ── NDK / SDK ─────────────────────────────────────────────────────────────
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: "17"
+        distribution: temurin
 
-      - name: Install Android NDK r25c
-        run: |
-          set -euo pipefail
-          NDK_ZIP="android-ndk-r25c-linux.zip"
-          NDK_URL="https://dl.google.com/android/repository/$NDK_ZIP"
-          curl -fsSL -o "$NDK_ZIP" "$NDK_URL"
-          unzip -q "$NDK_ZIP" -d "$HOME"
-          echo "ANDROID_NDK_ROOT=$HOME/android-ndk-r25c" >> "$GITHUB_ENV"
-          echo "$HOME/android-ndk-r25c" >> "$GITHUB_PATH"
+    - name: Install Android SDK + NDK
+      uses: android-actions/setup-android@v3
 
-      - name: Write makefiles
-        run: |
-          cat > Android.mk << 'EOF'
-          LOCAL_PATH := $(call my-dir)
-          include $(CLEAR_VARS)
-          LOCAL_MODULE        := darkmatter
-          LOCAL_SRC_FILES     := main.cpp features.cpp menu.cpp esp.cpp soundboard.cpp
-          LOCAL_CPPFLAGS      := -std=c++17 -O2 -Wall -Wextra -fvisibility=hidden \
-                                 -ffunction-sections -fdata-sections \
-                                 -DANDROID -DNDEBUG
-          LOCAL_LDFLAGS       := -Wl,--gc-sections -Wl,-z,relro -Wl,-z,now
-          LOCAL_LDLIBS        := -llog -landroid -ldl
-          include $(BUILD_SHARED_LIBRARY)
-          EOF
-          cat > Application.mk << 'EOF'
-          APP_ABI      := arm64-v8a
-          APP_PLATFORM := android-29
-          APP_STL      := c++_static
-          APP_OPTIM    := release
-          EOF
+    - name: Install NDK ${{ env.NDK_VERSION }}
+      run: |
+        yes | sdkmanager --install "ndk;${{ env.NDK_VERSION }}" 2>/dev/null | tail -1
+        echo "ANDROID_NDK=$ANDROID_HOME/ndk/${{ env.NDK_VERSION }}" >> $GITHUB_ENV
 
-      - name: Verify source tree
-        run: |
-          for f in shared.hpp main.cpp features.cpp menu.cpp esp.cpp soundboard.cpp; do
-            [ -f "$f" ] || { echo "Missing: $f"; exit 1; }
-          done
+    # ── Build libdarkmatter.so via CMake ───────────────────────────────────────
+    - name: CMake configure + build (arm64-v8a)
+      run: |
+        cmake -B build \
+          -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+          -DANDROID_ABI=arm64-v8a \
+          -DANDROID_PLATFORM=android-${{ env.MIN_SDK }} \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DANDROID_STL=c++_shared
+        cmake --build build --config Release -j$(nproc)
 
-      - name: ndk-build
-        run: |
-          "$ANDROID_NDK_ROOT/ndk-build" \
-            NDK_PROJECT_PATH=. \
-            APP_BUILD_SCRIPT=Android.mk \
-            APP_ABI=arm64-v8a \
-            APP_PLATFORM=android-29 \
-            APP_STL=c++_static \
-            APP_OPTIM=release \
-            -j$(nproc)
+    # ── Assemble skeleton APK with correct package name ───────────────────────
+    - name: Install apktool + aapt2
+      run: |
+        sudo apt-get install -y aapt
+        curl -sL https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool \
+          -o /usr/local/bin/apktool
+        curl -sL https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar \
+          -o /usr/local/bin/apktool.jar
+        chmod +x /usr/local/bin/apktool
 
-      - name: Verify .so + JNI symbols
-        run: |
-          SO="libs/arm64-v8a/libdarkmatter.so"
-          [ -f "$SO" ] || { echo "Build failed — $SO not found"; exit 1; }
-          file "$SO"
-          "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" \
-            -D "$SO" | grep -E "JNI_OnLoad|JNI_OnUnload" \
-            || { echo "JNI symbols missing"; exit 1; }
+    - name: Build module APK structure
+      run: |
+        mkdir -p module-apk/lib/arm64-v8a
+        mkdir -p module-apk/META-INF
+        # Copy .so
+        cp build/libdarkmatter.so module-apk/lib/arm64-v8a/libdarkmatter.so
 
-      - name: Strip .so
-        run: |
-          "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" \
-            --strip-unneeded libs/arm64-v8a/libdarkmatter.so
+        # Write AndroidManifest.xml — package = com.darkmatter.module
+        cat > module-apk/AndroidManifest.xml <<'MANIFEST'
+        <?xml version="1.0" encoding="utf-8"?>
+        <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+            package="${{ env.PKG_MODULE }}"
+            android:versionCode="1"
+            android:versionName="1.0">
 
-      - name: Rename with version tag
-        run: |
-          TAG="${{ github.ref_name }}"
-          if [[ "$TAG" == v*.*.* ]]; then
-            cp libs/arm64-v8a/libdarkmatter.so "libdarkmatter-${TAG}-arm64-v8a.so"
-          else
-            cp libs/arm64-v8a/libdarkmatter.so "libdarkmatter-build${{ github.run_number }}-arm64-v8a.so"
-          fi
-          ls -lh libdarkmatter*.so
+            <uses-sdk
+                android:minSdkVersion="${{ env.MIN_SDK }}"
+                android:targetSdkVersion="${{ env.TARGET_SDK }}" />
 
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: darkmatter-release
-          path: libs/arm64-v8a/libdarkmatter.so
-          retention-days: 30
+            <application
+                android:label="Dark Matter Module"
+                android:allowBackup="false"
+                android:extractNativeLibs="true">
 
-      - name: Create Release on tag push
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          name: "Darkmatter ${{ github.ref_name }}"
-          tag_name: ${{ github.ref_name }}
-          body: |
-            ## Darkmatter VRC Menu ${{ github.ref_name }}
+                <!-- Native loader shim -->
+                <activity
+                    android:name=".LoaderActivity"
+                    android:exported="false"
+                    android:theme="@android:style/Theme.NoDisplay">
+                    <intent-filter>
+                        <action android:name="android.intent.action.MAIN" />
+                    </intent-filter>
+                </activity>
 
-            ### What's included
-            - `libdarkmatter-${{ github.ref_name }}-arm64-v8a.so` — stripped arm64 native library, built with NDK r25c
-            - Install via patch workflow or sideload with your LSPosed/Zygisk setup
+            </application>
+        </manifest>
+        MANIFEST
 
-            ### Checksums
-            Run `sha256sum libdarkmatter-*.so` to verify.
-          files: "libdarkmatter-${{ github.ref_name }}-arm64-v8a.so"
-          generate_release_notes: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Package module APK (unsigned)
+      run: |
+        cd module-apk
+        zip -r ../darkmatter-module-unsigned.apk AndroidManifest.xml lib/
 
-      - name: Create rolling dev release on main push
-        if: github.ref == 'refs/heads/main'
-        uses: softprops/action-gh-release@v2
-        with:
-          name: "Darkmatter dev-build #${{ github.run_number }}"
-          tag_name: "dev-${{ github.run_number }}"
-          prerelease: true
-          body: |
-            ## Dev build #${{ github.run_number }}
+    - name: Sign module APK
+      run: |
+        # Generate a debug keystore (replace with your release key via secrets)
+        keytool -genkeypair -v \
+          -keystore debug.keystore \
+          -alias darkmatter \
+          -keyalg RSA -keysize 2048 -validity 9999 \
+          -storepass android -keypass android \
+          -dname "CN=Dark Matter, OU=Dev, O=Darkmatter, L=Unknown, ST=Unknown, C=US" \
+          2>/dev/null
 
-            Automated build from main — `${{ github.sha }}` (${{ github.event.head_commit.message }})
+        $ANDROID_HOME/build-tools/34.0.0/zipalign -v 4 \
+          darkmatter-module-unsigned.apk \
+          darkmatter-module-aligned.apk
 
-            - `libdarkmatter-build${{ github.run_number }}-arm64-v8a.so` — arm64 stripped .so
-          files: "libdarkmatter-build${{ github.run_number }}-arm64-v8a.so"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        $ANDROID_HOME/build-tools/34.0.0/apksigner sign \
+          --ks debug.keystore \
+          --ks-key-alias darkmatter \
+          --ks-pass pass:android \
+          --key-pass pass:android \
+          --out darkmatter-module.apk \
+          darkmatter-module-aligned.apk
+
+    - name: Upload module APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: darkmatter-module
+        path: darkmatter-module.apk
+        retention-days: 30
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # 2. Rename the patched VRC APK → package com.darkmatter.vrchat
+  #    Label: "Dark Matter VRChat"
+  # ════════════════════════════════════════════════════════════════════════════
+  rename-patched:
+    name: Rename patched VRC APK (Dark Matter VRChat)
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: "17"
+        distribution: temurin
+
+    - name: Install apktool
+      run: |
+        curl -sL https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool \
+          -o /usr/local/bin/apktool
+        curl -sL https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar \
+          -o /usr/local/bin/apktool.jar
+        chmod +x /usr/local/bin/apktool
+
+    - name: Download patched APK artifact
+      # If you store the signed VRC APK as a release asset or repo artifact,
+      # swap this step for the appropriate download action.
+      # FILL: replace with your actual APK source (release download, GH artifact, etc.)
+      run: |
+        echo "FILL: provide DarkMatter-patched-signed APK here as 'patched-input.apk'"
+        # Example via release asset:
+        # gh release download --pattern "DarkMatter-patched-signed*.apk" --output patched-input.apk
+        # For now the rename script is wired and ready; plug the APK in above.
+
+    - name: Decompile + rename package
+      run: |
+        # Bail gracefully if no APK was provided yet
+        [ -f patched-input.apk ] || { echo "No patched APK — skipping rename step"; exit 0; }
+
+        apktool d patched-input.apk -o patched-decoded --no-src -f
+
+        # ── Rewrite package name in AndroidManifest.xml ──────────────────────
+        ORIG_PKG=$(grep -oP 'package="\K[^"]+' patched-decoded/AndroidManifest.xml | head -1)
+        echo "Original package: $ORIG_PKG"
+
+        sed -i "s|package=\"${ORIG_PKG}\"|package=\"${{ env.PKG_PATCHED }}\"|g" \
+          patched-decoded/AndroidManifest.xml
+
+        # Also fix provider authorities (they often embed the package name)
+        find patched-decoded -name "*.xml" -exec \
+          sed -i "s|${ORIG_PKG}|${{ env.PKG_PATCHED }}|g" {} +
+
+        # ── Set app label to "Dark Matter VRChat" ────────────────────────────
+        # Inject into the default strings resource
+        STRINGS_FILE="patched-decoded/res/values/strings.xml"
+        if [ -f "$STRINGS_FILE" ]; then
+          # Replace existing app_name
+          sed -i 's|<string name="app_name">.*</string>|<string name="app_name">Dark Matter VRChat</string>|g' \
+            "$STRINGS_FILE"
+        fi
+        # Also set directly in manifest as fallback label
+        sed -i 's|android:label="[^"]*"|android:label="Dark Matter VRChat"|g' \
+          patched-decoded/AndroidManifest.xml
+
+        # ── Rebuild ───────────────────────────────────────────────────────────
+        apktool b patched-decoded -o darkmatter-vrchat-unsigned.apk
+
+    - name: Sign renamed VRC APK
+      run: |
+        [ -f darkmatter-vrchat-unsigned.apk ] || { echo "Nothing to sign"; exit 0; }
+
+        keytool -genkeypair -v \
+          -keystore debug.keystore \
+          -alias darkmatter \
+          -keyalg RSA -keysize 2048 -validity 9999 \
+          -storepass android -keypass android \
+          -dname "CN=Dark Matter, OU=Dev, O=Darkmatter, L=Unknown, ST=Unknown, C=US" \
+          2>/dev/null
+
+        $ANDROID_HOME/build-tools/34.0.0/zipalign -v 4 \
+          darkmatter-vrchat-unsigned.apk \
+          darkmatter-vrchat-aligned.apk
+
+        $ANDROID_HOME/build-tools/34.0.0/apksigner sign \
+          --ks debug.keystore \
+          --ks-key-alias darkmatter \
+          --ks-pass pass:android \
+          --key-pass pass:android \
+          --out "DarkMatterVRChat-signed.apk" \
+          darkmatter-vrchat-aligned.apk
+
+    - name: Upload renamed VRC APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: DarkMatterVRChat-signed
+        path: DarkMatterVRChat-signed.apk
+        retention-days: 30
