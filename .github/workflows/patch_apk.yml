@@ -12,9 +12,12 @@ jobs:
   patch:
     runs-on: ubuntu-24.04
 
+    permissions:
+      contents: write
+
     env:
       MODULE_PKG:  com.darkmatter.module
-      SIGNED_PKG:  com.darkmatter.vrchat
+      SIGNED_PKG:  com.vrchat.oculus.quest
 
     steps:
       - name: Checkout
