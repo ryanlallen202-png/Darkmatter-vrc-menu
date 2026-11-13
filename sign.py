@@ -5,104 +5,105 @@ from cryptography.hazmat.primitives.serialization import pkcs7
 from cryptography import x509
 from cryptography.x509.oid import NameOID
 
-SIGNED_PKG = os.environ.get("SIGNED_PKG", "com.darkmatter.vrchat")
+# ── Modded VRChat gets its own package so it installs ALONGSIDE real VRChat ──
+MODDED_PKG   = "com.darkmatter.vrchat"   # installs as separate app
+ORIGINAL_PKG = "com.vrchat.oculus.quest"
 
-WRAP_SH = b"#!/system/bin/sh\n" \
-          b"HERE=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\n" \
-          b"export LD_PRELOAD=\"$HERE/libdarkmatter.so${LD_PRELOAD:+:$LD_PRELOAD}\"\n" \
-          b"if [ -f \"$HERE/libgadget.so\" ]; then\n" \
-          b"    export LD_PRELOAD=\"$HERE/libgadget.so:$LD_PRELOAD\"\n" \
-          b"fi\n" \
-          b"exec \"$@\"\n"
-
-def patch_manifest(data_bytes, new_package):
-    data    = bytearray(data_bytes)
-    old_pkg = "com.vrchat.oculus.quest"
-    old_b   = old_pkg.encode("utf-16-le")
-    new_b   = new_package.encode("utf-16-le")
-    old_len = len(old_pkg)
-    new_len = len(new_package)
-    idx = data.find(old_b)
-    if idx != -1:
-        if new_len <= old_len:
-            padded = new_b + b"\x00\x00" * (old_len - new_len)
-            data[idx:idx + len(old_b)] = padded
-            struct.pack_into("<H", data, idx - 2, new_len)
-            if idx >= 4: struct.pack_into("<H", data, idx - 4, new_len)
-        else:
-            data[idx:idx + len(new_b)] = new_b
-            struct.pack_into("<H", data, idx - 2, new_len)
-        print(f"Patched package -> {new_package}")
-    ah = data.find(bytes([0xbe, 0x00, 0x01, 0x01]))
-    if ah != -1:
-        vo = ah + 16
-        if vo + 4 <= len(data) and struct.unpack_from("<I", data, vo)[0] == 0:
-            struct.pack_into("<I", data, vo, 1)
-            print("Patched extractNativeLibs -> true")
-    return bytes(data)
-
-key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-nm  = x509.Name([
-    x509.NameAttribute(NameOID.COMMON_NAME, "DarkMatter"),
-    x509.NameAttribute(NameOID.ORGANIZATION_NAME, "olivia"),
-])
-cert = (x509.CertificateBuilder()
-    .subject_name(nm).issuer_name(nm).public_key(key.public_key())
-    .serial_number(x509.random_serial_number())
-    .not_valid_before(datetime.datetime(2024,1,1))
-    .not_valid_after(datetime.datetime(2034,1,1))
-    .sign(key, hashes.SHA256()))
-
-src = "VRChat.apk"
-dst = "DarkMatter-patched-signed.apk"
-STORE_EXTS = {".so", ".arsc", ".png", ".jpg", ".flat"}
-
-manifest_lines = ["Manifest-Version: 1.0\r\nCreated-By: ollie\r\n\r\n"]
-digests = {}
-
-with zipfile.ZipFile(src, "r") as zin:
-    for item in zin.infolist():
-        if item.filename.startswith("META-INF/"): continue
-        if item.filename == "lib/arm64-v8a/libvrc_fast_crypto.so":
-            d = open("unpacked/lib/arm64-v8a/libvrc_fast_crypto.so","rb").read()
-        elif item.filename == "AndroidManifest.xml":
-            d = patch_manifest(zin.read(item.filename), SIGNED_PKG)
-        else:
-            d = zin.read(item.filename)
-        sha = base64.b64encode(hashlib.sha256(d).digest()).decode()
-        manifest_lines.append(f"Name: {item.filename}\r\nSHA-256-Digest: {sha}\r\n\r\n")
-        digests[item.filename] = (sha, d)
-
-# sign wrap.sh as part of the APK
-wrap_sha = base64.b64encode(hashlib.sha256(WRAP_SH).digest()).decode()
-manifest_lines.append(f"Name: lib/arm64-v8a/wrap.sh\r\nSHA-256-Digest: {wrap_sha}\r\n\r\n")
-digests["lib/arm64-v8a/wrap.sh"] = (wrap_sha, WRAP_SH)
-
-manifest = "".join(manifest_lines).encode()
-sf_lines = ["Signature-Version: 1.0\r\nCreated-By: ollie\r\nSHA-256-Digest-Manifest: "
-            + base64.b64encode(hashlib.sha256(manifest).digest()).decode() + "\r\n\r\n"]
-for n,(s,_) in digests.items():
-    sf_lines.append(f"Name: {n}\r\nSHA-256-Digest: {s}\r\n\r\n")
-sf = "".join(sf_lines).encode()
-
-p7 = (pkcs7.PKCS7SignatureBuilder()
-      .set_data(sf).add_signer(cert, key, hashes.SHA256())
-      .sign(serialization.Encoding.DER, [pkcs7.PKCS7Options.DetachedSignature]))
-
-with zipfile.ZipFile(src, "r") as zin:
-    with zipfile.ZipFile(dst, "w", allowZip64=True) as zout:
+def sign_apk(src, dst):
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    nm  = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, "DarkMatter"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "olivia"),
+    ])
+    cert = (x509.CertificateBuilder()
+        .subject_name(nm).issuer_name(nm)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.datetime(2024,1,1))
+        .not_valid_after(datetime.datetime(2034,1,1))
+        .sign(key, hashes.SHA256()))
+    STORE_EXTS = {".so", ".arsc"}
+    manifest_lines = ["Manifest-Version: 1.0\r\nCreated-By: ollie\r\n\r\n"]
+    digests = {}
+    with zipfile.ZipFile(src, "r") as zin:
         for item in zin.infolist():
             if item.filename.startswith("META-INF/"): continue
-            _, d = digests[item.filename]
-            ext = os.path.splitext(item.filename)[1].lower()
-            item.compress_type = zipfile.ZIP_STORED if ext in STORE_EXTS or item.filename == "resources.arsc" else zipfile.ZIP_DEFLATED
-            zout.writestr(item, d)
-        info_ws = zipfile.ZipInfo("lib/arm64-v8a/wrap.sh")
-        info_ws.compress_type = zipfile.ZIP_STORED
-        zout.writestr(info_ws, WRAP_SH)
-        zout.writestr("META-INF/MANIFEST.MF", manifest)
-        zout.writestr("META-INF/CERT.SF", sf)
-        zout.writestr("META-INF/CERT.RSA", p7)
+            d = zin.read(item.filename)
+            sha = base64.b64encode(hashlib.sha256(d).digest()).decode()
+            manifest_lines.append(f"Name: {item.filename}\r\nSHA-256-Digest: {sha}\r\n\r\n")
+            digests[item.filename] = (sha, d)
+    manifest = "".join(manifest_lines).encode()
+    sf_lines = ["Signature-Version: 1.0\r\nCreated-By: ollie\r\nSHA-256-Digest-Manifest: "
+                + base64.b64encode(hashlib.sha256(manifest).digest()).decode() + "\r\n\r\n"]
+    for n,(s,_) in digests.items():
+        sf_lines.append(f"Name: {n}\r\nSHA-256-Digest: {s}\r\n\r\n")
+    sf = "".join(sf_lines).encode()
+    p7 = (pkcs7.PKCS7SignatureBuilder()
+          .set_data(sf).add_signer(cert, key, hashes.SHA256())
+          .sign(serialization.Encoding.DER, [pkcs7.PKCS7Options.DetachedSignature]))
+    with zipfile.ZipFile(src, "r") as zin:
+        with zipfile.ZipFile(dst, "w", allowZip64=True) as zout:
+            for item in zin.infolist():
+                if item.filename.startswith("META-INF/"): continue
+                _, d = digests[item.filename]
+                ext = os.path.splitext(item.filename)[1].lower()
+                item.compress_type = zipfile.ZIP_STORED if ext in STORE_EXTS else zipfile.ZIP_DEFLATED
+                zout.writestr(item, d)
+            zout.writestr("META-INF/MANIFEST.MF", manifest)
+            zout.writestr("META-INF/CERT.SF", sf)
+            zout.writestr("META-INF/CERT.RSA", p7)
 
-print(f"{dst}: {os.path.getsize(dst)//1024//1024}MB  package={SIGNED_PKG}")
-print("[+] wrap.sh injected — sideload direct, no root needed")
+def swap_pkg_in_manifest(apk_path, old_pkg, new_pkg):
+    with zipfile.ZipFile(apk_path) as z:
+        data = bytearray(z.read("AndroidManifest.xml"))
+    old_b = old_pkg.encode("utf-16-le")
+    new_b = new_pkg.encode("utf-16-le")
+    idx = 0
+    count = 0
+    while True:
+        pos = data.find(old_b, idx)
+        if pos == -1: break
+        # pad new to same byte length as old
+        if len(new_b) <= len(old_b):
+            padded = new_b + b"\x00\x00" * ((len(old_b) - len(new_b)) // 2)
+            data[pos:pos+len(old_b)] = padded
+        else:
+            data[pos:pos+len(new_b)] = new_b
+        # patch length prefix
+        if pos >= 2:
+            struct.pack_into("<H", data, pos-2, len(new_pkg))
+        count += 1
+        idx = pos + len(old_b)
+    print(f"Package swap {old_pkg} -> {new_pkg} ({count}x)")
+    return bytes(data)
+
+# ── Build modded VRChat APK with new package name ────────────────────────────
+print(f"Building modded VRChat — package: {MODDED_PKG}")
+patched_manifest = swap_pkg_in_manifest("VRChat.apk", ORIGINAL_PKG, MODDED_PKG)
+
+# Verify swap worked
+if MODDED_PKG.encode("utf-16-le") in patched_manifest:
+    print(f"VERIFIED: {MODDED_PKG} in manifest")
+else:
+    print("WARNING: package swap may have failed — check manifest")
+
+# Repack with patched lib + patched manifest
+with zipfile.ZipFile("VRChat.apk", "r") as zin:
+    with zipfile.ZipFile("DarkMatter-modded-unsigned.apk", "w", allowZip64=True) as zout:
+        for item in zin.infolist():
+            if item.filename.startswith("META-INF/"): continue
+            if item.filename == "AndroidManifest.xml":
+                info = zipfile.ZipInfo("AndroidManifest.xml")
+                info.compress_type = zipfile.ZIP_STORED
+                zout.writestr(info, patched_manifest)
+                continue
+            if item.filename == "lib/arm64-v8a/libvrc_fast_crypto.so":
+                data = open("unpacked/lib/arm64-v8a/libvrc_fast_crypto.so","rb").read()
+            else:
+                data = zin.read(item.filename)
+            ext = os.path.splitext(item.filename)[1].lower()
+            item.compress_type = zipfile.ZIP_STORED if ext in {".so",".arsc"} else zipfile.ZIP_DEFLATED
+            zout.writestr(item, data)
+
+sign_apk("DarkMatter-modded-unsigned.apk", "DarkMatter-modded-signed.apk")
+print(f"DarkMatter-modded-signed.apk: {os.path.getsize('DarkMatter-modded-signed.apk')//1024//1024}MB — package: {MODDED_PKG}")
