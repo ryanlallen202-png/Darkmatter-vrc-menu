@@ -1,12 +1,49 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+    Dark Matter — Module APK
+    Package : com.darkmatter.module
+    Label   : Dark Matter Module
+    This manifest is baked into the module APK by the GitHub Actions workflow.
+-->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.darkmatter.vrc"
+    package="com.darkmatter.module"
     android:versionCode="1"
     android:versionName="1.0">
-    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="32"/>
-    <application android:label="Darkmatter VRC" android:hasCode="false">
-        <meta-data android:name="xposedmodule" android:value="true"/>
-        <meta-data android:name="xposeddescription" android:value="Darkmatter VRChat mod menu"/>
-        <meta-data android:name="xposedminversion" android:value="93"/>
+
+    <uses-sdk
+        android:minSdkVersion="29"
+        android:targetSdkVersion="34" />
+
+    <!-- Quest permissions -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="com.oculus.permission.HAND_TRACKING" />
+
+    <uses-feature
+        android:name="android.hardware.vr.headtracking"
+        android:required="false" />
+
+    <application
+        android:label="Dark Matter Module"
+        android:allowBackup="false"
+        android:extractNativeLibs="true"
+        android:requestLegacyExternalStorage="true">
+
+        <!--
+            Loader shim — invisible activity that bootstraps the native lib.
+            The actual work happens in JNI_OnLoad inside libdarkmatter.so.
+        -->
+        <activity
+            android:name=".LoaderActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.NoDisplay"
+            android:launchMode="singleTask">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+            </intent-filter>
+        </activity>
+
     </application>
+
 </manifest>
