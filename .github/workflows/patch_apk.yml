@@ -64,21 +64,21 @@ jobs:
           print("All checks passed.")
           EOF
 
-      - name: Delete old v1.1 assets if exist
+      - name: Delete old v1.2 assets if exist
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release view v1.1 --json assets --jq '.assets[].name' 2>/dev/null | while read name; do
+          gh release view v1.2 --json assets --jq '.assets[].name' 2>/dev/null | while read name; do
             echo "Deleting old asset: $name"
-            gh release delete-asset v1.1 "$name" -y 2>/dev/null || true
+            gh release delete-asset v1.2 "$name" -y 2>/dev/null || true
           done
 
-      - name: Upload to v1.1 release
+      - name: Upload to v1.2 release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload v1.1 \
+          gh release upload v1.2 \
             "DarkMatter-patched-signed.apk" \
             "darkmatter-module.apk" \
             --clobber
-          echo "Uploaded both APKs to v1.1"
+          echo "Uploaded both APKs to v1.2"
