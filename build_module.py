@@ -5,19 +5,11 @@ from cryptography.hazmat.primitives.serialization import pkcs7
 from cryptography import x509
 from cryptography.x509.oid import NameOID
 
-MODULE_PKG = os.environ.get("MODULE_PKG", "com.darkmatter.module")
-
-# wrap.sh — the entire no-root mechanism.
-# Android executes this before the app process when wrap.sh
-# exists at lib/<abi>/wrap.sh and extractNativeLibs=true.
-# We LD_PRELOAD libdarkmatter.so so it loads into VRChat cold.
-WRAP_SH = b"#!/system/bin/sh\n" \
-          b"HERE=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\n" \
-          b"export LD_PRELOAD=\"$HERE/libdarkmatter.so${LD_PRELOAD:+:$LD_PRELOAD}\"\n" \
-          b"if [ -f \"$HERE/libgadget.so\" ]; then\n" \
-          b"    export LD_PRELOAD=\"$HERE/libgadget.so:$LD_PRELOAD\"\n" \
-          b"fi\n" \
-          b"exec \"$@\"\n"
+# ── Package names ────────────────────────────────────────────────────────────
+# Patched VRChat keeps its original package so it installs as VRChat
+VRCHAT_PKG  = "com.vrchat.oculus.quest"
+# Module gets its own unique package so Android installs it as a separate app
+MODULE_PKG  = "com.darkmatter.menu"
 
 def sign_apk(src, dst):
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -62,41 +54,51 @@ def sign_apk(src, dst):
             zout.writestr("META-INF/CERT.SF", sf)
             zout.writestr("META-INF/CERT.RSA", p7)
 
-def patch_binary_manifest(apk_path, new_package):
-    with zipfile.ZipFile(apk_path) as z:
-        data = bytearray(z.read("AndroidManifest.xml"))
-    old_pkg   = "com.vrchat.oculus.quest"
-    old_bytes = old_pkg.encode("utf-16-le")
-    new_bytes = new_package.encode("utf-16-le")
-    old_len   = len(old_pkg)
-    new_len   = len(new_package)
-    idx = data.find(old_bytes)
-    if idx == -1:
-        print("WARNING: package string not found")
-    else:
-        if new_len <= old_len:
-            padded = new_bytes + b"\x00\x00" * (old_len - new_len)
-            data[idx:idx + len(old_bytes)] = padded
-            struct.pack_into("<H", data, idx - 2, new_len)
-            if idx >= 4: struct.pack_into("<H", data, idx - 4, new_len)
+def swap_string_utf16le(data, old_str, new_str):
+    """Find old_str encoded as UTF-16-LE in data and swap to new_str in-place."""
+    old_b = old_str.encode("utf-16-le")
+    new_b = new_str.encode("utf-16-le")
+    idx = 0
+    count = 0
+    while True:
+        pos = data.find(old_b, idx)
+        if pos == -1:
+            break
+        # Pad or truncate to same byte length as old
+        if len(new_b) <= len(old_b):
+            padded = new_b + b"\x00\x00" * ((len(old_b) - len(new_b)) // 2)
+            data[pos:pos+len(old_b)] = padded
         else:
-            data[idx:idx + len(new_bytes)] = new_bytes
-            struct.pack_into("<H", data, idx - 2, new_len)
-        print(f"Patched package -> {new_package}")
-    # flip extractNativeLibs false->true (attr hash 0x010100be)
-    ah = data.find(bytes([0xbe, 0x00, 0x01, 0x01]))
-    if ah != -1:
-        vo = ah + 16
-        if vo + 4 <= len(data) and struct.unpack_from("<I", data, vo)[0] == 0:
-            struct.pack_into("<I", data, vo, 1)
-            print("Patched extractNativeLibs -> true")
-    else:
-        print("WARN: extractNativeLibs attr not found by hash")
-    return bytes(data)
+            # Extend — just overwrite, may corrupt adjacent data if too different
+            data[pos:pos+len(new_b)] = new_b
+        # Patch the UTF-16-LE length field (uint16 2 bytes before string)
+        len_pos = pos - 2
+        if len_pos >= 0:
+            struct.pack_into("<H", data, len_pos, len(new_str))
+        count += 1
+        idx = pos + max(len(old_b), len(new_b))
+    return count
 
-print(f"Building no-root Darkmatter APK — package: {MODULE_PKG}")
-binary_manifest = patch_binary_manifest("VRChat.apk", MODULE_PKG)
+# ── Build module APK ─────────────────────────────────────────────────────────
+print(f"Building module APK — package: {MODULE_PKG}")
 
+with zipfile.ZipFile("VRChat.apk") as z:
+    manifest_data = bytearray(z.read("AndroidManifest.xml"))
+
+# Swap every occurrence of the VRChat package name to our module package
+n = swap_string_utf16le(manifest_data, VRCHAT_PKG, MODULE_PKG)
+print(f"Swapped package string {n}x: {VRCHAT_PKG} -> {MODULE_PKG}")
+
+# Verify the swap worked
+if MODULE_PKG.encode("utf-16-le") in manifest_data:
+    print(f"VERIFIED: {MODULE_PKG} present in binary manifest")
+else:
+    print("WARNING: package swap may have failed")
+
+# Also swap the app label to Darkmatter Menu
+swap_string_utf16le(manifest_data, "VRChat", "Darkmatter Menu")
+
+# Pick the .so payload
 so_path = None
 for root, dirs, files in os.walk("."):
     for fn in files:
@@ -106,30 +108,20 @@ for root, dirs, files in os.walk("."):
     if so_path: break
 if not so_path:
     so_path = "unpacked/lib/arm64-v8a/libvrc_fast_crypto.so"
-    print("Fallback: patched libvrc_fast_crypto.so")
-
-print(f"Payload: {so_path} ({os.path.getsize(so_path)//1024}KB)")
+    print(f"Payload: patched libvrc_fast_crypto.so ({os.path.getsize(so_path)//1024}KB)")
 
 with zipfile.ZipFile("darkmatter-module-unsigned.apk", "w", zipfile.ZIP_DEFLATED) as z:
     info_mf = zipfile.ZipInfo("AndroidManifest.xml")
     info_mf.compress_type = zipfile.ZIP_STORED
-    z.writestr(info_mf, binary_manifest)
-    z.writestr("assets/xposed_init", (MODULE_PKG + ".XposedInit\n").encode())
-    info_ws = zipfile.ZipInfo("lib/arm64-v8a/wrap.sh")
-    info_ws.compress_type = zipfile.ZIP_STORED
-    z.writestr(info_ws, WRAP_SH)
-    print("[+] wrap.sh injected — no-root LD_PRELOAD hook")
+    z.writestr(info_mf, bytes(manifest_data))
+
+    z.writestr("assets/xposed_init", f"{MODULE_PKG}.XposedInit\n".encode())
+
     info_so = zipfile.ZipInfo("lib/arm64-v8a/libdarkmatter.so")
     info_so.compress_type = zipfile.ZIP_STORED
     with open(so_path, "rb") as f:
         z.writestr(info_so, f.read())
-    if os.path.exists("frida-gadget.so"):
-        info_fg = zipfile.ZipInfo("lib/arm64-v8a/libgadget.so")
-        info_fg.compress_type = zipfile.ZIP_STORED
-        with open("frida-gadget.so", "rb") as f:
-            z.writestr(info_fg, f.read())
-        print("[+] Frida gadget injected")
 
 sign_apk("darkmatter-module-unsigned.apk", "darkmatter-module.apk")
-print(f"darkmatter-module.apk: {os.path.getsize('darkmatter-module.apk')//1024}KB")
-print("[+] Sideload this APK directly — no root, no LSPosed needed")
+size = os.path.getsize("darkmatter-module.apk")
+print(f"darkmatter-module.apk: {size//1024}KB — package: {MODULE_PKG}")
