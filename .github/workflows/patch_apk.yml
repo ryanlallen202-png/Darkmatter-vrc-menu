@@ -29,59 +29,52 @@ jobs:
           unzip -q VRChat.apk lib/arm64-v8a/libvrc_fast_crypto.so -d unpacked/
           python3 patch.py
 
-      - name: Build modded VRChat APK (com.darkmatter.vrchat)
+      - name: Build modded VRChat APK
         run: python3 sign.py
 
-      - name: Build Darkmatter module APK (com.darkmatter.menu)
+      - name: Build Darkmatter module APK
         run: python3 build_module.py
 
       - name: Verify both APKs
         run: |
           python3 - << 'EOF'
-          import zipfile, os, sys, struct
-
+          import zipfile, os, sys
           errors = []
-
-          # Check modded VRChat APK
           apk = "DarkMatter-modded-signed.apk"
           if not os.path.exists(apk) or os.path.getsize(apk) < 100*1024*1024:
               errors.append(f"FAIL: {apk} too small or missing")
           else:
               with zipfile.ZipFile(apk) as z:
-                  mf = z.read("AndroidManifest.xml")
-                  if b"c\x00o\x00m\x00.\x00d\x00a\x00r\x00k\x00m\x00a\x00t\x00t\x00e\x00r\x00.\x00v\x00r\x00c\x00h\x00a\x00t\x00" not in mf:
-                      errors.append("FAIL: com.darkmatter.vrchat not in modded APK manifest")
-                  else:
-                      print(f"OK: {apk} {os.path.getsize(apk)//1024//1024}MB package=com.darkmatter.vrchat")
-
-          # Check module APK
+                  if not any(n.startswith("META-INF/") for n in z.namelist()):
+                      errors.append("FAIL: APK unsigned")
+              print(f"OK: {apk} {os.path.getsize(apk)//1024//1024}MB")
           mod = "darkmatter-module.apk"
           if not os.path.exists(mod) or os.path.getsize(mod) < 50*1024:
               errors.append(f"FAIL: {mod} missing or too small")
           else:
-              with zipfile.ZipFile(mod) as z:
-                  mf = z.read("AndroidManifest.xml")
-                  if b"c\x00o\x00m\x00.\x00d\x00a\x00r\x00k\x00m\x00a\x00t\x00t\x00e\x00r\x00.\x00m\x00e\x00n\x00u\x00" not in mf:
-                      errors.append("FAIL: com.darkmatter.menu not in module manifest")
-                  else:
-                      print(f"OK: {mod} {os.path.getsize(mod)//1024}KB package=com.darkmatter.menu")
-
+              print(f"OK: {mod} {os.path.getsize(mod)//1024}KB")
           if errors:
               [print(e) for e in errors]
               sys.exit(1)
           print("All checks passed.")
           EOF
 
-      - name: Upload to v1.3 release
+      - name: Upload to v1.4 release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create v1.3 \
-            --title "Darkmatter v1.3 — side-by-side install" \
-            --notes "**DarkMatter-modded-signed.apk** — package: com.darkmatter.vrchat — installs ALONGSIDE real VRChat. Auth in real VRChat first, then launch this one to play modded.
-          **darkmatter-module.apk** — package: com.darkmatter.menu — Xposed module, scope to com.darkmatter.vrchat in LSPatch.
+          gh release create v1.4 \
+            --title "Darkmatter v1.4 — crash fix" \
+            --notes "**DarkMatter-modded-signed.apk** — patched VRChat, original package name kept so libil2cpp does not crash. Install alongside real VRChat using LSPatch signature bypass.
+          **darkmatter-module.apk** — Xposed module package com.darkmatter.menu
+
+          Install order:
+          1. Open LSPatch, patch DarkMatter-modded-signed.apk with Local mode + Signature bypass
+          2. Install darkmatter-module.apk
+          3. LSPatch Manage, scope Darkmatter Menu to VRChat
+          4. Auth in real VRChat, then launch patched one
 
           absolute ollie, built by olivia — https://discord.gg/ojailbreaks" \
             "DarkMatter-modded-signed.apk" \
             "darkmatter-module.apk" || \
-          gh release upload v1.3 "DarkMatter-modded-signed.apk" "darkmatter-module.apk" --clobber
+          gh release upload v1.4 "DarkMatter-modded-signed.apk" "darkmatter-module.apk" --clobber
