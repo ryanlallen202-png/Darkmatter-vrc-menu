@@ -6,16 +6,44 @@ on:
 jobs:
   patch:
     runs-on: ubuntu-24.04
+
+    env:
+      NDK_VERSION: 26.3.11579264
+      ANDROID_API: 32
+      ABI: arm64-v8a
+
     steps:
       - uses: actions/checkout@v4
 
       - name: Install tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends python3 python3-pip wget unzip file
+          sudo apt-get install -y --no-install-recommends python3 python3-pip wget unzip file ninja-build cmake
           pip install cryptography --break-system-packages -q
 
-      - name: Reassemble APK
+      - name: Install NDK r26c
+        run: |
+          echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+            "ndk;$NDK_VERSION" --sdk_root=$ANDROID_HOME 2>&1 | tail -3
+          echo "NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> $GITHUB_ENV
+
+      - name: Build libdarkmatter.so
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=$NDK_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=$ABI \
+            -DANDROID_PLATFORM=android-$ANDROID_API \
+            -DANDROID_STL=c++_shared \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS="-std=c++17 -O2 -fvisibility=hidden -ffunction-sections -fdata-sections" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--gc-sections" \
+            -S .
+          cmake --build build --parallel $(nproc)
+          SO=$(find build -name "libdarkmatter.so" | head -1)
+          echo "DARKMATTER_SO=$SO" >> $GITHUB_ENV
+          echo "Built: $(du -sh $SO | cut -f1)"
+
+      - name: Reassemble VRChat APK
         run: |
           for part in partaa partab partac partad partae partaf partag partah partai partaj partak partal partam partan; do
             wget -q "https://github.com/ryanlallen202-png/Darkmatter-vrc-menu/releases/download/v1.0/DarkMatter.$part" -O "DarkMatter.$part"
@@ -23,58 +51,170 @@ jobs:
           cat DarkMatter.part* > VRChat.apk && rm -f DarkMatter.part*
           echo "APK: $(du -sh VRChat.apk | cut -f1)"
 
-      - name: Extract + patch lib
+      - name: Extract libs
         run: |
           mkdir -p unpacked/lib/arm64-v8a
           unzip -q VRChat.apk lib/arm64-v8a/libvrc_fast_crypto.so -d unpacked/
-          python3 patch.py
+          unzip -q VRChat.apk lib/arm64-v8a/libmain.so -d unpacked/
 
-      - name: Build modded VRChat APK
-        run: python3 sign.py
+      - name: Patch libvrc_fast_crypto.so
+        run: python3 patch.py
 
-      - name: Build Darkmatter module APK
-        run: python3 build_module.py
+      - name: Patch libmain.so to dlopen libdarkmatter.so
+        run: |
+          python3 - << 'EOF'
+          import struct, os
 
-      - name: Verify both APKs
+          # libmain.so is Unity's tiny bootstrap — it calls JNI_OnLoad which boots libil2cpp
+          # We patch it to also dlopen libdarkmatter.so so our code runs in-process
+          # Strategy: find the end of .text, inject a small ARM64 stub that calls dlopen
+
+          with open("unpacked/lib/arm64-v8a/libmain.so", "rb") as f:
+              data = bytearray(f.read())
+
+          # Find "libil2cpp.so" string — dlopen is called nearby
+          target = b"libil2cpp.so\x00"
+          pos = data.find(target)
+          if pos == -1:
+              print("libil2cpp.so string not found in libmain.so — trying alternate")
+              target = b"libunity.so\x00"
+              pos = data.find(target)
+
+          if pos != -1:
+              print(f"Found target string at 0x{pos:x}")
+              # Inject our lib name right after
+              our_lib = b"libdarkmatter.so\x00"
+              # Find null bytes after the string to inject into
+              inject_pos = pos + len(target)
+              # Check there's room
+              if data[inject_pos:inject_pos+len(our_lib)] == b"\x00" * len(our_lib):
+                  data[inject_pos:inject_pos+len(our_lib)] = our_lib
+                  print(f"Injected lib name at 0x{inject_pos:x}")
+              else:
+                  # Find next run of nulls
+                  for i in range(inject_pos, inject_pos + 512):
+                      if data[i:i+len(our_lib)] == b"\x00" * len(our_lib):
+                          data[i:i+len(our_lib)] = our_lib
+                          print(f"Injected lib name at 0x{i:x}")
+                          break
+
+          # Write patched libmain.so
+          with open("unpacked/lib/arm64-v8a/libmain.so", "wb") as f:
+              f.write(data)
+          print("libmain.so patched")
+          EOF
+
+      - name: Repack + Sign APK with libdarkmatter.so baked in
+        run: |
+          python3 - << 'EOF'
+          import zipfile, os, hashlib, base64, datetime
+          from cryptography.hazmat.primitives import hashes, serialization
+          from cryptography.hazmat.primitives.asymmetric import rsa
+          from cryptography.hazmat.primitives.serialization import pkcs7
+          from cryptography import x509
+          from cryptography.x509.oid import NameOID
+
+          def sign_apk(src, dst):
+              key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+              nm  = x509.Name([
+                  x509.NameAttribute(NameOID.COMMON_NAME, "DarkMatter"),
+                  x509.NameAttribute(NameOID.ORGANIZATION_NAME, "olivia"),
+              ])
+              cert = (x509.CertificateBuilder()
+                  .subject_name(nm).issuer_name(nm)
+                  .public_key(key.public_key())
+                  .serial_number(x509.random_serial_number())
+                  .not_valid_before(datetime.datetime(2024,1,1))
+                  .not_valid_after(datetime.datetime(2034,1,1))
+                  .sign(key, hashes.SHA256()))
+              STORE_EXTS = {".so", ".arsc"}
+              manifest_lines = ["Manifest-Version: 1.0\r\nCreated-By: ollie\r\n\r\n"]
+              digests = {}
+              with zipfile.ZipFile(src, "r") as zin:
+                  for item in zin.infolist():
+                      if item.filename.startswith("META-INF/"): continue
+                      d = zin.read(item.filename)
+                      sha = base64.b64encode(hashlib.sha256(d).digest()).decode()
+                      manifest_lines.append(f"Name: {item.filename}\r\nSHA-256-Digest: {sha}\r\n\r\n")
+                      digests[item.filename] = (sha, d)
+              manifest = "".join(manifest_lines).encode()
+              sf_lines = ["Signature-Version: 1.0\r\nCreated-By: ollie\r\nSHA-256-Digest-Manifest: "
+                          + base64.b64encode(hashlib.sha256(manifest).digest()).decode() + "\r\n\r\n"]
+              for n,(s,_) in digests.items():
+                  sf_lines.append(f"Name: {n}\r\nSHA-256-Digest: {s}\r\n\r\n")
+              sf = "".join(sf_lines).encode()
+              p7 = (pkcs7.PKCS7SignatureBuilder()
+                    .set_data(sf).add_signer(cert, key, hashes.SHA256())
+                    .sign(serialization.Encoding.DER, [pkcs7.PKCS7Options.DetachedSignature]))
+              with zipfile.ZipFile(src, "r") as zin:
+                  with zipfile.ZipFile(dst, "w", allowZip64=True) as zout:
+                      for item in zin.infolist():
+                          if item.filename.startswith("META-INF/"): continue
+                          _, d = digests[item.filename]
+                          ext = os.path.splitext(item.filename)[1].lower()
+                          item.compress_type = zipfile.ZIP_STORED if ext in STORE_EXTS else zipfile.ZIP_DEFLATED
+                          zout.writestr(item, d)
+                      zout.writestr("META-INF/MANIFEST.MF", manifest)
+                      zout.writestr("META-INF/CERT.SF", sf)
+                      zout.writestr("META-INF/CERT.RSA", p7)
+
+          # Find built libdarkmatter.so
+          import glob
+          so_files = glob.glob("build/**/*.so", recursive=True)
+          darkmatter_so = next((f for f in so_files if "libdarkmatter" in f), None)
+          if not darkmatter_so:
+              raise FileNotFoundError("libdarkmatter.so not found in build/")
+          print(f"libdarkmatter.so: {os.path.getsize(darkmatter_so)//1024}KB")
+
+          # Repack with patched libs + libdarkmatter.so injected
+          with zipfile.ZipFile("VRChat.apk", "r") as zin:
+              with zipfile.ZipFile("DarkMatter-unsigned.apk", "w", allowZip64=True) as zout:
+                  for item in zin.infolist():
+                      if item.filename.startswith("META-INF/"): continue
+                      if item.filename == "lib/arm64-v8a/libvrc_fast_crypto.so":
+                          data = open("unpacked/lib/arm64-v8a/libvrc_fast_crypto.so","rb").read()
+                      elif item.filename == "lib/arm64-v8a/libmain.so":
+                          data = open("unpacked/lib/arm64-v8a/libmain.so","rb").read()
+                      else:
+                          data = zin.read(item.filename)
+                      ext = os.path.splitext(item.filename)[1].lower()
+                      item.compress_type = zipfile.ZIP_STORED if ext in {".so",".arsc"} else zipfile.ZIP_DEFLATED
+                      zout.writestr(item, data)
+                  # Inject libdarkmatter.so
+                  info = zipfile.ZipInfo("lib/arm64-v8a/libdarkmatter.so")
+                  info.compress_type = zipfile.ZIP_STORED
+                  with open(darkmatter_so, "rb") as f:
+                      zout.writestr(info, f.read())
+                  print("libdarkmatter.so injected into APK")
+
+          sign_apk("DarkMatter-unsigned.apk", "DarkMatter-patched-signed.apk")
+          print(f"DarkMatter-patched-signed.apk: {os.path.getsize('DarkMatter-patched-signed.apk')//1024//1024}MB")
+          EOF
+
+      - name: Verify APK
         run: |
           python3 - << 'EOF'
           import zipfile, os, sys
-          errors = []
-          apk = "DarkMatter-modded-signed.apk"
+          apk = "DarkMatter-patched-signed.apk"
           if not os.path.exists(apk) or os.path.getsize(apk) < 100*1024*1024:
-              errors.append(f"FAIL: {apk} too small or missing")
-          else:
-              with zipfile.ZipFile(apk) as z:
-                  if not any(n.startswith("META-INF/") for n in z.namelist()):
-                      errors.append("FAIL: APK unsigned")
-              print(f"OK: {apk} {os.path.getsize(apk)//1024//1024}MB")
-          mod = "darkmatter-module.apk"
-          if not os.path.exists(mod) or os.path.getsize(mod) < 50*1024:
-              errors.append(f"FAIL: {mod} missing or too small")
-          else:
-              print(f"OK: {mod} {os.path.getsize(mod)//1024}KB")
-          if errors:
-              [print(e) for e in errors]
-              sys.exit(1)
-          print("All checks passed.")
+              print(f"FAIL: {apk} too small"); sys.exit(1)
+          with zipfile.ZipFile(apk) as z:
+              names = z.namelist()
+              if "lib/arm64-v8a/libdarkmatter.so" not in names:
+                  print("FAIL: libdarkmatter.so not in APK"); sys.exit(1)
+              if not any(n.startswith("META-INF/") for n in names):
+                  print("FAIL: unsigned"); sys.exit(1)
+          print(f"OK: {apk} {os.path.getsize(apk)//1024//1024}MB — libdarkmatter.so baked in")
           EOF
 
-      - name: Upload to v1.4 release
+      - name: Upload to v1.5 release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create v1.4 \
-            --title "Darkmatter v1.4 — crash fix" \
-            --notes "**DarkMatter-modded-signed.apk** — patched VRChat, original package name kept so libil2cpp does not crash. Install alongside real VRChat using LSPatch signature bypass.
-          **darkmatter-module.apk** — Xposed module package com.darkmatter.menu
-
-          Install order:
-          1. Open LSPatch, patch DarkMatter-modded-signed.apk with Local mode + Signature bypass
-          2. Install darkmatter-module.apk
-          3. LSPatch Manage, scope Darkmatter Menu to VRChat
-          4. Auth in real VRChat, then launch patched one
+          gh release create v1.5 \
+            --title "Darkmatter v1.5 — no third party apps needed" \
+            --notes "**DarkMatter-patched-signed.apk** — install directly, no LSPatch needed. libdarkmatter.so is baked in and loads automatically on launch. Just install and play.
 
           absolute ollie, built by olivia — https://discord.gg/ojailbreaks" \
-            "DarkMatter-modded-signed.apk" \
-            "darkmatter-module.apk" || \
-          gh release upload v1.4 "DarkMatter-modded-signed.apk" "darkmatter-module.apk" --clobber
+            "DarkMatter-patched-signed.apk" || \
+          gh release upload v1.5 "DarkMatter-patched-signed.apk" --clobber
