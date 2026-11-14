@@ -5,8 +5,8 @@ from cryptography.hazmat.primitives.serialization import pkcs7
 from cryptography import x509
 from cryptography.x509.oid import NameOID
 
-# ── Modded VRChat gets its own package so it installs ALONGSIDE real VRChat ──
-MODDED_PKG   = "com.darkmatter.vrchat"   # installs as separate app
+# Keep original package — swapping it makes libil2cpp crash on self-check
+# Android allows two APKs with same package if signed with different keys
 ORIGINAL_PKG = "com.vrchat.oculus.quest"
 
 def sign_apk(src, dst):
@@ -53,50 +53,13 @@ def sign_apk(src, dst):
             zout.writestr("META-INF/CERT.SF", sf)
             zout.writestr("META-INF/CERT.RSA", p7)
 
-def swap_pkg_in_manifest(apk_path, old_pkg, new_pkg):
-    with zipfile.ZipFile(apk_path) as z:
-        data = bytearray(z.read("AndroidManifest.xml"))
-    old_b = old_pkg.encode("utf-16-le")
-    new_b = new_pkg.encode("utf-16-le")
-    idx = 0
-    count = 0
-    while True:
-        pos = data.find(old_b, idx)
-        if pos == -1: break
-        # pad new to same byte length as old
-        if len(new_b) <= len(old_b):
-            padded = new_b + b"\x00\x00" * ((len(old_b) - len(new_b)) // 2)
-            data[pos:pos+len(old_b)] = padded
-        else:
-            data[pos:pos+len(new_b)] = new_b
-        # patch length prefix
-        if pos >= 2:
-            struct.pack_into("<H", data, pos-2, len(new_pkg))
-        count += 1
-        idx = pos + len(old_b)
-    print(f"Package swap {old_pkg} -> {new_pkg} ({count}x)")
-    return bytes(data)
+print("Building modded VRChat APK — original package, different signature...")
 
-# ── Build modded VRChat APK with new package name ────────────────────────────
-print(f"Building modded VRChat — package: {MODDED_PKG}")
-patched_manifest = swap_pkg_in_manifest("VRChat.apk", ORIGINAL_PKG, MODDED_PKG)
-
-# Verify swap worked
-if MODDED_PKG.encode("utf-16-le") in patched_manifest:
-    print(f"VERIFIED: {MODDED_PKG} in manifest")
-else:
-    print("WARNING: package swap may have failed — check manifest")
-
-# Repack with patched lib + patched manifest
+# Repack with patched lib only — no manifest changes
 with zipfile.ZipFile("VRChat.apk", "r") as zin:
     with zipfile.ZipFile("DarkMatter-modded-unsigned.apk", "w", allowZip64=True) as zout:
         for item in zin.infolist():
             if item.filename.startswith("META-INF/"): continue
-            if item.filename == "AndroidManifest.xml":
-                info = zipfile.ZipInfo("AndroidManifest.xml")
-                info.compress_type = zipfile.ZIP_STORED
-                zout.writestr(info, patched_manifest)
-                continue
             if item.filename == "lib/arm64-v8a/libvrc_fast_crypto.so":
                 data = open("unpacked/lib/arm64-v8a/libvrc_fast_crypto.so","rb").read()
             else:
@@ -106,4 +69,4 @@ with zipfile.ZipFile("VRChat.apk", "r") as zin:
             zout.writestr(item, data)
 
 sign_apk("DarkMatter-modded-unsigned.apk", "DarkMatter-modded-signed.apk")
-print(f"DarkMatter-modded-signed.apk: {os.path.getsize('DarkMatter-modded-signed.apk')//1024//1024}MB — package: {MODDED_PKG}")
+print(f"DarkMatter-modded-signed.apk: {os.path.getsize('DarkMatter-modded-signed.apk')//1024//1024}MB")
