@@ -263,6 +263,36 @@ void PatchEAC(uintptr_t base) {
         }
     }
     LOGI("EAC patches applied");
+
+    // ── XOR metadata key zero (bypass encrypted global-metadata.dat) ──────
+    {
+        uintptr_t key_addr = base + (uintptr_t)METADATA_XOR_KEY_RVA;
+        uintptr_t page = key_addr & ~((uintptr_t)(getpagesize()-1));
+        if (mprotect((void*)page, getpagesize()*2, PROT_READ|PROT_WRITE|PROT_EXEC) == 0) {
+            memset((void*)key_addr, 0, 4);
+            __builtin___clear_cache((char*)key_addr, (char*)(key_addr+4));
+            LOGI("PatchEAC: XOR key zeroed");
+        }
+    }
+    // ── libvrc_fast_crypto runtime patches via dlsym ──────────────────────
+    {
+        static const uint8_t kRT[8]={0x20,0x00,0x80,0x52,0xC0,0x03,0x5F,0xD6};
+        static const uint8_t kRZ[8]={0x00,0x00,0x80,0x52,0xC0,0x03,0x5F,0xD6};
+        void* hc = dlopen("libvrc_fast_crypto.so", RTLD_NOW|RTLD_NOLOAD);
+        if (!hc) hc = dlopen("libvrc_fast_crypto.so", RTLD_NOW);
+        if (hc) {
+            const char* tru[]={"verify_message","sign_message",nullptr};
+            const char* zer[]={"generate_signing_key",nullptr};
+            for(int i=0;tru[i];i++){
+                void* a=dlsym(hc,tru[i]);
+                if(a) RetTrue((uintptr_t)a);
+            }
+            for(int i=0;zer[i];i++){
+                void* a=dlsym(hc,zer[i]);
+                if(a) RetPatch((uintptr_t)a);
+            }
+        }
+    }
 }
 
 // ============================================================================
