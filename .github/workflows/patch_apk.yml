@@ -38,7 +38,7 @@ jobs:
             -DCMAKE_CXX_FLAGS="-std=c++17 -O2 -fvisibility=hidden -ffunction-sections -fdata-sections" \
             -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--gc-sections" \
             -S .
-          cmake --build build --parallel $(nproc)
+          cmake --build build --parallel $(nproc) 2>&1 || (cat build/CMakeFiles/*.log 2>/dev/null; cmake --build build --parallel $(nproc) -- VERBOSE=1 2>&1 | tail -100; exit 1)
           SO=$(find build -name "libdarkmatter.so" | head -1)
           echo "DARKMATTER_SO=$SO" >> $GITHUB_ENV
           echo "Built: $(du -sh $SO | cut -f1)"
