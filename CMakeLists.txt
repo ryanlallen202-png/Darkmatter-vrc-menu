@@ -11,6 +11,7 @@ add_library(darkmatter SHARED
     menu.cpp
     esp.cpp
     soundboard.cpp
+    eac_bypass.cpp
 )
 
 # ── Compiler flags (AArch64, NDK26) ──────────────────────────────────────────
