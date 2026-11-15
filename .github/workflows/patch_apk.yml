@@ -37,8 +37,18 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_FLAGS="-std=c++17 -O2 -fvisibility=hidden -ffunction-sections -fdata-sections" \
             -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--gc-sections" \
-            -S .
-          cmake --build build --parallel $(nproc) 2>&1 || (cat build/CMakeFiles/*.log 2>/dev/null; cmake --build build --parallel $(nproc) -- VERBOSE=1 2>&1 | tail -100; exit 1)
+            -S . 2>&1
+          cmake --build build --parallel $(nproc) 2>&1
+          if [ $? -ne 0 ]; then
+            echo "=== BUILD FAILED — FULL ERROR OUTPUT ==="
+            find build -name "*.log" | xargs cat 2>/dev/null
+            $NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++ \
+              --target=aarch64-linux-android32 \
+              --sysroot=$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot \
+              -std=c++17 -I. -DANDROID \
+              -c features.cpp -o /tmp/test_features.o 2>&1 || true
+            exit 1
+          fi
           SO=$(find build -name "libdarkmatter.so" | head -1)
           echo "DARKMATTER_SO=$SO" >> $GITHUB_ENV
           echo "Built: $(du -sh $SO | cut -f1)"
